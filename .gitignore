@@ -1,0 +1,21 @@
+# Build output
+/target/
+/recoverpill/target/
+
+# Executables
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust
+Cargo.lock
+
+# Python (old files)
+__pycache__/
+*.pyc
