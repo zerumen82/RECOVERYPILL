@@ -1,21 +1,21 @@
 //! Información de unidades de disco
-//! 
+//!
 //! Proporciona funciones para detectar y obtener información de las unidades disponibles.
 
-use std::path::PathBuf;
+use log::{info, warn};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use log::{info, warn};
-use winapi::um::fileapi::{GetDriveTypeW, GetDiskFreeSpaceExW, GetLogicalDrives};
-use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_ATTRIBUTE_READONLY};
+use std::path::PathBuf;
+use winapi::um::fileapi::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives};
+use winapi::um::winnt::{FILE_ATTRIBUTE_READONLY, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 /// Tipos de unidades de disco
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveType {
     Unknown,
     NoRootDir,
-    Removable,    // USB, SD card
-    Fixed,        // Disco duro interno
+    Removable, // USB, SD card
+    Fixed,     // Disco duro interno
     Network,
     CDRom,
     RamDisk,
@@ -51,7 +51,7 @@ impl DriveType {
 /// Información de una unidad de disco
 #[derive(Debug, Clone)]
 pub struct DriveInfo {
-    pub path: String,              // ej: "C:"
+    pub path: String, // ej: "C:"
     pub drive_type: DriveType,
     pub total_bytes: u64,
     pub free_bytes: u64,
@@ -133,18 +133,27 @@ impl DriveInfo {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        
+
         // Usar la estructura correcta para ULARGE_INTEGER
         #[repr(C)]
         struct ULARGE_INTEGER {
             LowPart: u32,
             HighPart: u32,
         }
-        
-        let mut free_bytes_available: ULARGE_INTEGER = ULARGE_INTEGER { LowPart: 0, HighPart: 0 };
-        let mut total_bytes: ULARGE_INTEGER = ULARGE_INTEGER { LowPart: 0, HighPart: 0 };
-        let mut total_free_bytes: ULARGE_INTEGER = ULARGE_INTEGER { LowPart: 0, HighPart: 0 };
-        
+
+        let mut free_bytes_available: ULARGE_INTEGER = ULARGE_INTEGER {
+            LowPart: 0,
+            HighPart: 0,
+        };
+        let mut total_bytes: ULARGE_INTEGER = ULARGE_INTEGER {
+            LowPart: 0,
+            HighPart: 0,
+        };
+        let mut total_free_bytes: ULARGE_INTEGER = ULARGE_INTEGER {
+            LowPart: 0,
+            HighPart: 0,
+        };
+
         unsafe {
             let result = GetDiskFreeSpaceExW(
                 wide_path.as_ptr(),
@@ -152,14 +161,15 @@ impl DriveInfo {
                 &mut total_bytes as *mut ULARGE_INTEGER as *mut _,
                 &mut total_free_bytes as *mut ULARGE_INTEGER as *mut _,
             );
-            
+
             if result != 0 {
                 let total = ((total_bytes.HighPart as u64) << 32) | (total_bytes.LowPart as u64);
-                let free = ((free_bytes_available.HighPart as u64) << 32) | (free_bytes_available.LowPart as u64);
+                let free = ((free_bytes_available.HighPart as u64) << 32)
+                    | (free_bytes_available.LowPart as u64);
                 return (total, free);
             }
         }
-        
+
         (0, 0)
     }
 
@@ -167,7 +177,7 @@ impl DriveInfo {
     pub fn from_drive_letter(letter: char) -> Option<Self> {
         let path = format!("{}:\\", letter);
         let drive_type = Self::get_drive_type(&path);
-        
+
         if drive_type == DriveType::Unknown || drive_type == DriveType::NoRootDir {
             return None;
         }
@@ -190,18 +200,19 @@ impl DriveInfo {
 /// Obtiene todas las unidades lógicas disponibles en el sistema
 pub fn get_available_drives() -> Vec<DriveInfo> {
     let mut drives = Vec::new();
-    
+
     unsafe {
         let logical_drives = GetLogicalDrives();
-        
+
         // Iterar sobre las letras A-Z (26 bits)
         for i in 0..26 {
             if (logical_drives & (1 << i)) != 0 {
                 let letter = (b'A' + i as u8) as char;
-                
+
                 if let Some(drive_info) = DriveInfo::from_drive_letter(letter) {
-                    info!("Unidad detectada: {} - {} ({}: {})", 
-                        drive_info.path, 
+                    info!(
+                        "Unidad detectada: {} - {} ({}: {})",
+                        drive_info.path,
                         drive_info.volume_label,
                         drive_info.drive_type.display_name(),
                         DriveInfo::format_size(drive_info.total_bytes)

@@ -1,19 +1,19 @@
 //! Clasificador de archivos con IA
-//! 
+//!
 //! Utiliza análisis de entropía y firmas para clasificar archivos y predecir recuperabilidad.
 
-use std::collections::HashMap;
-use log::{info, debug};
-use crate::core::signatures::{FileType, FileSignature, SIGNATURE_DATABASE};
 use crate::ai::entropy::EntropyAnalyzer;
+use crate::core::signatures::{FileSignature, FileType, SIGNATURE_DATABASE};
+use log::{debug, info};
+use std::collections::HashMap;
 
 /// Predicción de recuperación de un archivo
 #[derive(Debug, Clone)]
 pub struct RecoveryPrediction {
-    pub probability: f64,           // 0-100%
+    pub probability: f64, // 0-100%
     pub is_fragmented: bool,
     pub is_corrupted: bool,
-    pub confidence: f64,            // 0-100%
+    pub confidence: f64, // 0-100%
     pub recommendation: String,
 }
 
@@ -45,62 +45,75 @@ impl AIClassifier {
     /// Crea un nuevo clasificador
     pub fn new() -> Self {
         info!("Inicializando clasificador IA");
-        
+
         let entropy_analyzer = EntropyAnalyzer::new();
-        
+
         // Inicializar patrones conocidos
         let mut type_patterns = HashMap::new();
-        
+
         // Patrones de JPEG
-        type_patterns.insert(FileType::Jpeg, vec![
-            Pattern {
+        type_patterns.insert(
+            FileType::Jpeg,
+            vec![Pattern {
                 magic_bytes: vec![0xFF, 0xD8, 0xFF],
                 offset: 0,
                 weight: 1.0,
-            },
-        ]);
-        
+            }],
+        );
+
         // Patrones de PNG
-        type_patterns.insert(FileType::Png, vec![
-            Pattern {
+        type_patterns.insert(
+            FileType::Png,
+            vec![Pattern {
                 magic_bytes: vec![0x89, 0x50, 0x4E, 0x47],
                 offset: 0,
                 weight: 1.0,
-            },
-        ]);
-        
+            }],
+        );
+
         // Patrones de PDF
-        type_patterns.insert(FileType::Pdf, vec![
-            Pattern {
+        type_patterns.insert(
+            FileType::Pdf,
+            vec![Pattern {
                 magic_bytes: vec![0x25, 0x50, 0x44, 0x46],
                 offset: 0,
                 weight: 1.0,
-            },
-        ]);
-        
+            }],
+        );
+
         AIClassifier {
             entropy_analyzer,
             type_patterns,
         }
     }
 
-    /// Clasifica datos crudos
+    /// Clasifica datos crudos - optimizado para velocidad
     pub fn classify(&self, data: &[u8]) -> FileClassification {
-        // Detectar tipo de archivo
+        // Detectar tipo de archivo (más rápido)
         let (file_type, signature_confidence) = self.detect_file_type(data);
-        
-        // Calcular entropía
-        let entropy = self.entropy_analyzer.calculate(data);
-        
-        // Verificar si el archivo es válido
-        let is_valid = self.validate_data(data, &file_type);
-        
-        // Calcular predicción de recuperación
+
+        // Calcular entropía (optimizado) - usar ventana más pequeña
+        let entropy = if data.len() > 2048 {
+            self.entropy_analyzer.calculate(&data[..2048])
+        } else {
+            self.entropy_analyzer.calculate(data)
+        };
+
+        // Verificar si el archivo es válido (solo para tipos comunes)
+        let is_valid = match file_type {
+            FileType::Jpeg | FileType::Png | FileType::Gif | FileType::Bmp | FileType::Pdf => {
+                self.validate_data(data, &file_type)
+            }
+            _ => true, // Para otros tipos, asumir válidos para velocidad
+        };
+
+        // Calcular predicción de recuperación (simplificada)
         let recovery_prediction = self.predict_recovery(data, &file_type, entropy);
-        
+
         // Calcular confianza total
-        let confidence = (signature_confidence * 0.7 + recovery_prediction.confidence * 0.3).min(100.0);
-        
+        let confidence =
+            (signature_confidence * 0.7 + recovery_prediction.confidence * 0.3).min(100.0);
+
         FileClassification {
             file_type,
             confidence,
@@ -118,10 +131,10 @@ impl AIClassifier {
                 return (sig.file_type, 90.0);
             }
         }
-        
+
         // Si no hay coincidencia exacta, usar análisis de entropía
         let entropy = self.entropy_analyzer.calculate(data);
-        
+
         // Clasificación por entropía
         let inferred_type = if entropy < 1.0 {
             FileType::Unknown // Datos vacíos o muy repetitivos
@@ -134,7 +147,7 @@ impl AIClassifier {
         } else {
             FileType::Unknown // Posiblemente encriptado o aleatorio
         };
-        
+
         (inferred_type, 30.0)
     }
 
@@ -143,7 +156,7 @@ impl AIClassifier {
         if data.len() < 16 {
             return false;
         }
-        
+
         match file_type {
             FileType::Jpeg => self.validate_jpeg(data),
             FileType::Png => self.validate_png(data),
@@ -159,7 +172,7 @@ impl AIClassifier {
         if data.len() < 2 {
             return false;
         }
-        
+
         // Buscar SOI (Start Of Image)
         data.starts_with(&[0xFF, 0xD8])
     }
@@ -168,26 +181,25 @@ impl AIClassifier {
         if data.len() < 8 {
             return false;
         }
-        
+
         // Verificar PNG signature
         if !data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
             return false;
         }
-        
+
         // Verificar IEND chunk
-        data.windows(12).any(|w| {
-            w[0..4] == [0x00, 0x00, 0x00, 0x00] && &w[4..8] == b"IEND"
-        })
+        data.windows(12)
+            .any(|w| w[0..4] == [0x00, 0x00, 0x00, 0x00] && &w[4..8] == b"IEND")
     }
 
     fn validate_gif(&self, data: &[u8]) -> bool {
         if data.len() < 6 {
             return false;
         }
-        
+
         let is_gif87 = data.starts_with(b"GIF87a");
         let is_gif89 = data.starts_with(b"GIF89a");
-        
+
         (is_gif87 || is_gif89) && data.len() >= 10
     }
 
@@ -195,7 +207,7 @@ impl AIClassifier {
         if data.len() < 2 {
             return false;
         }
-        
+
         data.starts_with(&[0x42, 0x4D]) // "BM"
     }
 
@@ -203,17 +215,22 @@ impl AIClassifier {
         if data.len() < 5 {
             return false;
         }
-        
+
         data.starts_with(b"%PDF-")
     }
 
     /// Predice la probabilidad de recuperación
-    fn predict_recovery(&self, data: &[u8], file_type: &FileType, entropy: f64) -> RecoveryPrediction {
+    fn predict_recovery(
+        &self,
+        data: &[u8],
+        file_type: &FileType,
+        entropy: f64,
+    ) -> RecoveryPrediction {
         let mut probability: f64 = 80.0; // Base probability
         let mut is_fragmented = false;
         let mut is_corrupted = false;
         let mut confidence: f64 = 70.0;
-        
+
         // Ajuste por entropía
         if entropy < 2.0 {
             probability -= 40.0;
@@ -227,7 +244,7 @@ impl AIClassifier {
             probability += 10.0;
             confidence = 85.0;
         }
-        
+
         // Ajuste por tipo de archivo
         match file_type {
             FileType::Jpeg | FileType::Png | FileType::Gif | FileType::Bmp => {
@@ -246,17 +263,17 @@ impl AIClassifier {
             }
             _ => {}
         }
-        
+
         // Validación de estructura
         if !self.validate_data(data, file_type) {
             probability -= 30.0;
             is_corrupted = true;
             confidence -= 20.0;
         }
-        
+
         probability = probability.max(0.0).min(100.0);
         confidence = confidence.max(0.0).min(100.0);
-        
+
         // Recomendación
         let recommendation = if probability > 80.0 {
             "Alta probabilidad de recuperación exitosa".to_string()
@@ -267,7 +284,7 @@ impl AIClassifier {
         } else {
             "Baja probabilidad de recuperación".to_string()
         };
-        
+
         RecoveryPrediction {
             probability,
             is_fragmented,
@@ -293,31 +310,31 @@ impl AIClassifier {
             valid_files: 0,
             corrupted_files: 0,
         };
-        
+
         if classifications.is_empty() {
             return stats;
         }
-        
+
         let mut total_confidence = 0.0;
         let mut total_recoverability = 0.0;
-        
+
         for c in classifications {
             let type_name = c.file_type.display_name();
             *stats.by_type.entry(type_name.to_string()).or_insert(0) += 1;
-            
+
             total_confidence += c.confidence;
             total_recoverability += c.recovery_prediction.probability;
-            
+
             if c.is_valid {
                 stats.valid_files += 1;
             } else {
                 stats.corrupted_files += 1;
             }
         }
-        
+
         stats.average_confidence = total_confidence / classifications.len() as f64;
         stats.average_recoverability = total_recoverability / classifications.len() as f64;
-        
+
         stats
     }
 }
@@ -346,11 +363,13 @@ mod tests {
     #[test]
     fn test_classifier() {
         let classifier = AIClassifier::new();
-        
+
         // Test JPEG
-        let jpeg_data = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01];
+        let jpeg_data = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        ];
         let classification = classifier.classify(&jpeg_data);
-        
+
         assert_eq!(classification.file_type, FileType::Jpeg);
         assert!(classification.confidence > 50.0);
     }
@@ -358,10 +377,10 @@ mod tests {
     #[test]
     fn test_pdf() {
         let classifier = AIClassifier::new();
-        
+
         let pdf_data = b"%PDF-1.4\n1 0 obj\n<<\n>>\nendobj";
         let classification = classifier.classify(pdf_data);
-        
+
         assert_eq!(classification.file_type, FileType::Pdf);
     }
 }

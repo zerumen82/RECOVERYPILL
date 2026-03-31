@@ -1,5 +1,5 @@
 //! Analizador de entropía
-//! 
+//!
 //! Calcula la entropía de Shannon de los datos para analizar su complejidad.
 
 use log::debug;
@@ -17,14 +17,20 @@ impl EntropyAnalyzer {
         }
     }
 
-    /// Calcula la entropía de Shannon
+    /// Calcula la entropía de Shannon - optimizado para velocidad
     pub fn calculate(&self, data: &[u8]) -> f64 {
         if data.is_empty() {
             return 0.0;
         }
 
-        // Usar toda la data para el cálculo
-        self.calculate_entropy(data)
+        // Usar una ventana más pequeña para cálculo rápido (2KB)
+        let calc_data = if data.len() > 2048 {
+            &data[..2048]
+        } else {
+            data
+        };
+
+        self.calculate_entropy(calc_data)
     }
 
     /// Calcula la entropía usando el método de Shannon
@@ -51,11 +57,11 @@ impl EntropyAnalyzer {
     /// Calcula la entropía por bloques
     pub fn calculate_block_entropy(&self, data: &[u8]) -> Vec<f64> {
         let mut entropies = Vec::new();
-        
+
         for chunk in data.chunks(self.block_size) {
             entropies.push(self.calculate_entropy(chunk));
         }
-        
+
         entropies
     }
 
@@ -63,25 +69,27 @@ impl EntropyAnalyzer {
     pub fn analyze(&self, data: &[u8]) -> EntropyAnalysis {
         let overall_entropy = self.calculate(data);
         let block_entropies = self.calculate_block_entropy(data);
-        
+
         let avg_block_entropy = if !block_entropies.is_empty() {
             block_entropies.iter().sum::<f64>() / block_entropies.len() as f64
         } else {
             0.0
         };
-        
+
         let variance = if block_entropies.len() > 1 {
             let mean = avg_block_entropy;
-            block_entropies.iter()
+            block_entropies
+                .iter()
                 .map(|e| (e - mean).powi(2))
-                .sum::<f64>() / block_entropies.len() as f64
+                .sum::<f64>()
+                / block_entropies.len() as f64
         } else {
             0.0
         };
-        
+
         // Clasificación basada en entropía
         let classification = classify_entropy(overall_entropy);
-        
+
         EntropyAnalysis {
             overall_entropy,
             avg_block_entropy,
@@ -94,7 +102,7 @@ impl EntropyAnalyzer {
     /// Estima si los datos están encriptados o comprimidos
     pub fn is_encrypted_or_compressed(&self, data: &[u8]) -> bool {
         let entropy = self.calculate(data);
-        
+
         // Alta entropía (> 7.5) sugiere datos encriptados o muy comprimidos
         entropy > 7.5
     }
@@ -102,10 +110,10 @@ impl EntropyAnalyzer {
     /// Detecta si hay datos aleatorios (posiblemente encriptados)
     pub fn detect_random_data(&self, data: &[u8]) -> f64 {
         let entropy = self.calculate(data);
-        
+
         // Comparar con entropía máxima teórica
         let max_entropy = 8.0; // log2(256)
-        
+
         // Porcentaje de "aleatoriedad"
         (entropy / max_entropy) * 100.0
     }
@@ -124,11 +132,11 @@ pub struct EntropyAnalysis {
 /// Clasificación de entropía
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntropyClass {
-    VeryLow,      // < 2.0 - Datos muy repetitivos
-    Low,          // 2.0 - 4.0 - Datos simples o texto
-    Medium,       // 4.0 - 6.0 - Datos estructurados
-    High,         // 6.0 - 7.5 - Datos complejos
-    VeryHigh,     // > 7.5 - Encriptado o muy comprimido
+    VeryLow,  // < 2.0 - Datos muy repetitivos
+    Low,      // 2.0 - 4.0 - Datos simples o texto
+    Medium,   // 4.0 - 6.0 - Datos estructurados
+    High,     // 6.0 - 7.5 - Datos complejos
+    VeryHigh, // > 7.5 - Encriptado o muy comprimido
 }
 
 impl EntropyClass {
@@ -196,11 +204,11 @@ mod tests {
     #[test]
     fn test_entropy_analysis() {
         let analyzer = EntropyAnalyzer::new();
-        
+
         // Datos simples
         let data = b"Hello World! Hello World! Hello World!";
         let analysis = analyzer.analyze(data);
-        
+
         assert_eq!(analysis.classification, EntropyClass::Low);
     }
 

@@ -1,16 +1,16 @@
 //! Acceso de bajo nivel al disco
-//! 
+//!
 //! Proporciona funciones para leer datos del disco usando Windows API.
 
-use std::ptr::null_mut;
-use winapi::um::fileapi::{CreateFileW, ReadFile, OPEN_EXISTING};
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::winnt::{GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, HANDLE};
-use winapi::um::fileapi::GetDiskFreeSpaceExW;
-use winapi::ctypes::c_void;
-use winapi::shared::minwindef::{DWORD, FALSE};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::ptr::null_mut;
+use winapi::ctypes::c_void;
+use winapi::shared::minwindef::{DWORD, FALSE};
+use winapi::um::fileapi::GetDiskFreeSpaceExW;
+use winapi::um::fileapi::{CreateFileW, ReadFile, OPEN_EXISTING};
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE};
 
 // FILE_BEGIN = 0 for SetFilePointer
 const FILE_BEGIN: DWORD = 0;
@@ -39,7 +39,10 @@ impl DiskReader {
         };
 
         // Convertir a wide string
-        let wide_path: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_path: Vec<u16> = device_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         // Abrir el dispositivo con permisos de lectura
         let handle = unsafe {
@@ -56,20 +59,23 @@ impl DiskReader {
 
         if handle == INVALID_HANDLE_VALUE {
             let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
-            return Err(format!("Error al abrir {}: Código de error {}", device_path, error));
+            return Err(format!(
+                "Error al abrir {}: Código de error {}",
+                device_path, error
+            ));
         }
 
         // Obtener el tamaño del dispositivo
         // Primero intentar con GetDiskFreeSpaceEx para volúmenes
         let total_bytes = get_volume_size_from_path(drive_path);
-        
+
         // Si es 0, intentar con DeviceIoControl
         let total_bytes = if total_bytes == 0 {
             get_disk_size(handle)
         } else {
             total_bytes
         };
-        
+
         // Si sigue siendo 0, intentar con el tamaño del volumen usando DeviceIoControl
         let total_bytes = if total_bytes == 0 {
             get_volume_size(handle).unwrap_or(0)
@@ -94,7 +100,7 @@ impl DiskReader {
         // Mover el puntero del archivo al offset deseado
         let mut distance_high: i32 = (offset >> 32) as i32;
         let distance_low = (offset & 0xFFFFFFFF) as i32;
-        
+
         let new_pos = unsafe {
             winapi::um::fileapi::SetFilePointer(
                 self.handle,
@@ -106,13 +112,16 @@ impl DiskReader {
 
         if new_pos == winapi::um::fileapi::INVALID_SET_FILE_POINTER {
             let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
-            return Err(format!("Error al posicionar en offset {}: {}", offset, error));
+            return Err(format!(
+                "Error al posicionar en offset {}: {}",
+                offset, error
+            ));
         }
 
         // Leer los datos
         let mut buffer = vec![0u8; size];
         let mut bytes_read: DWORD = 0;
-        
+
         let result = unsafe {
             ReadFile(
                 self.handle,
@@ -160,7 +169,7 @@ fn get_disk_size(handle: HANDLE) -> u64 {
     // Primero intentar con GET_DRIVE_GEOMETRY_EX que devuelve el tamaño real
     let mut bytes_returned: DWORD = 0;
     let mut disk_geometry_ex: [u8; 32] = [0; 32]; // DISK_GEOMETRY_EX
-    
+
     unsafe {
         let result = winapi::um::ioapiset::DeviceIoControl(
             handle,
@@ -172,7 +181,7 @@ fn get_disk_size(handle: HANDLE) -> u64 {
             &mut bytes_returned as *mut DWORD,
             null_mut(),
         );
-        
+
         if result != 0 && bytes_returned >= 24 {
             // En DISK_GEOMETRY_EX, el tamaño está en los primeros 8 bytes (QuadPart)
             let mut size_bytes = [0u8; 8];
@@ -180,11 +189,11 @@ fn get_disk_size(handle: HANDLE) -> u64 {
             return i64::from_le_bytes(size_bytes) as u64;
         }
     }
-    
+
     // Si falla, intentar con GET_DRIVE_GEOMETRY
     let mut bytes_returned: DWORD = 0;
     let mut disk_geometry: [u8; 64] = [0; 64]; // DISK_GEOMETRY
-    
+
     unsafe {
         let result = winapi::um::ioapiset::DeviceIoControl(
             handle,
@@ -196,21 +205,41 @@ fn get_disk_size(handle: HANDLE) -> u64 {
             &mut bytes_returned as *mut DWORD,
             null_mut(),
         );
-        
+
         if result != 0 && bytes_returned >= 32 {
             // Bytes por sector = 8-11
-            let bytes_per_sector = u32::from_le_bytes([disk_geometry[8], disk_geometry[9], disk_geometry[10], disk_geometry[11]]) as u64;
+            let bytes_per_sector = u32::from_le_bytes([
+                disk_geometry[8],
+                disk_geometry[9],
+                disk_geometry[10],
+                disk_geometry[11],
+            ]) as u64;
             // Sectores por pista = 12-15
-            let sectors = u32::from_le_bytes([disk_geometry[12], disk_geometry[13], disk_geometry[14], disk_geometry[15]]) as u64;
+            let sectors = u32::from_le_bytes([
+                disk_geometry[12],
+                disk_geometry[13],
+                disk_geometry[14],
+                disk_geometry[15],
+            ]) as u64;
             // Numero de pistas = 16-19
-            let tracks = u32::from_le_bytes([disk_geometry[16], disk_geometry[17], disk_geometry[18], disk_geometry[19]]) as u64;
+            let tracks = u32::from_le_bytes([
+                disk_geometry[16],
+                disk_geometry[17],
+                disk_geometry[18],
+                disk_geometry[19],
+            ]) as u64;
             // Number of Media = 20-23
-            let media = u32::from_le_bytes([disk_geometry[20], disk_geometry[21], disk_geometry[22], disk_geometry[23]]) as u64;
-            
+            let media = u32::from_le_bytes([
+                disk_geometry[20],
+                disk_geometry[21],
+                disk_geometry[22],
+                disk_geometry[23],
+            ]) as u64;
+
             return bytes_per_sector * sectors * tracks * media;
         }
     }
-    
+
     // Valor por defecto si no se puede obtener
     0
 }
@@ -219,7 +248,7 @@ fn get_disk_size(handle: HANDLE) -> u64 {
 fn get_volume_size(handle: HANDLE) -> Option<u64> {
     let mut bytes_returned: DWORD = 0;
     let mut volume_disk_extents: [u8; 64] = [0; 64]; // VOLUME_DISK_EXTENTS
-    
+
     unsafe {
         let result = winapi::um::ioapiset::DeviceIoControl(
             handle,
@@ -231,23 +260,28 @@ fn get_volume_size(handle: HANDLE) -> Option<u64> {
             &mut bytes_returned as *mut DWORD,
             null_mut(),
         );
-        
+
         if result != 0 && bytes_returned >= 24 {
             // Number of disk extents = 0-3
-            let num_extents = u32::from_le_bytes([volume_disk_extents[0], volume_disk_extents[1], volume_disk_extents[2], volume_disk_extents[3]]);
-            
+            let num_extents = u32::from_le_bytes([
+                volume_disk_extents[0],
+                volume_disk_extents[1],
+                volume_disk_extents[2],
+                volume_disk_extents[3],
+            ]);
+
             if num_extents > 0 {
                 // Starting offset = 8-15
                 // Partition size = 16-23
                 let mut part_size_bytes = [0u8; 8];
                 part_size_bytes.copy_from_slice(&volume_disk_extents[16..24]);
                 let part_size = u64::from_le_bytes(part_size_bytes);
-                
+
                 return Some(part_size);
             }
         }
     }
-    
+
     None
 }
 
@@ -261,16 +295,16 @@ fn get_volume_size_from_path(drive_path: &str) -> u64 {
     } else {
         drive_path.to_string()
     };
-    
+
     let wide_path: Vec<u16> = OsStr::new(&path)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    
+
     let mut free_bytes_available: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut total_free_bytes: u64 = 0;
-    
+
     unsafe {
         let result = GetDiskFreeSpaceExW(
             wide_path.as_ptr(),
@@ -278,11 +312,11 @@ fn get_volume_size_from_path(drive_path: &str) -> u64 {
             &mut total_bytes as *mut u64 as *mut _,
             &mut total_free_bytes as *mut u64 as *mut _,
         );
-        
+
         if result != 0 {
             return total_bytes;
         }
     }
-    
+
     0
 }

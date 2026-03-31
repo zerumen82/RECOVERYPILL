@@ -1,35 +1,38 @@
 //! recoverPill - Herramienta de Recuperación de Datos con IA
-//! 
+//!
 //! Programa ligero para recuperar archivos borrados de discos duros, USB y tarjetas SD.
 //! Utiliza Rust para máximo rendimiento y acceso de bajo nivel al disco.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod disk;
-mod core;
 mod ai;
+mod build_info;
+mod core;
+mod disk;
 mod ui;
 
-use log::{info, error, LevelFilter};
-use std::panic;
+use eframe::{egui, App, NativeOptions};
+use log::{error, info, LevelFilter};
 use std::io::Write;
-use eframe::{egui, NativeOptions, App};
+use std::panic;
 
 fn setup_logging() {
+    // Configurar para que los logs salgan por stderr/stdout siempre
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
+        .target(env_logger::Target::Stdout) // Forzar stdout para que sea visible
         .format(|buf, record| {
             writeln!(
                 buf,
-                "[{} {} {}:{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                "[{}] {:<5} - {}",
+                chrono::Local::now().format("%H:%M:%S"),
                 record.level(),
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
                 record.args()
             )
         })
         .init();
+    
+    info!("Logging inicializado correctamente");
 }
 
 fn setup_panic_handler() {
@@ -41,13 +44,13 @@ fn setup_panic_handler() {
         } else {
             "Unknown panic".to_string()
         };
-        
+
         let location = if let Some(loc) = panic_info.location() {
             format!("{}:{}:{}", loc.file(), loc.line(), loc.column())
         } else {
             "unknown location".to_string()
         };
-        
+
         error!("PANIC at {}: {}", location, msg);
     }));
 }
@@ -55,18 +58,24 @@ fn setup_panic_handler() {
 fn main() {
     setup_logging();
     setup_panic_handler();
-    
+
     info!("Iniciando recoverPill v1.0.0");
+    info!("Fecha de compilación: {}", build_info::BUILD_TIMESTAMP);
     info!("Plataforma: Windows");
-    
+
+    let title = format!(
+        "recoverPill - v1.0.0 (Build: {})",
+        build_info::BUILD_TIMESTAMP
+    );
+
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("recoverPill - Recuperación de Datos con IA"),
+            .with_title(&title),
         ..Default::default()
     };
-    
+
     if let Err(e) = eframe::run_native(
         "recoverPill",
         options,

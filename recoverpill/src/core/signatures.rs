@@ -1,11 +1,11 @@
 //! Base de datos de firmas de archivos
-//! 
+//!
 //! Define las firmas (magic bytes) para detectar diferentes tipos de archivos.
 
 use std::sync::LazyLock;
 
 /// Tipos de archivos soportados
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FileType {
     // Imágenes
     Jpeg,
@@ -17,7 +17,7 @@ pub enum FileType {
     Ico,
     // Imágenes adicionales
     Heic,
-    Raw,      // RAW de cámaras
+    Raw, // RAW de cámaras
     Psd,
     Ai,
     Svg,
@@ -159,23 +159,49 @@ impl FileType {
     /// Obtiene la categoría del archivo
     pub fn category(&self) -> &'static str {
         match self {
-            FileType::Jpeg | FileType::Png | FileType::Gif | FileType::Bmp | 
-            FileType::Tiff | FileType::Webp | FileType::Ico |
-            FileType::Heic | FileType::Raw | FileType::Psd | FileType::Ai | FileType::Svg => "Imágenes",
-            
-            FileType::Pdf | FileType::Doc | FileType::Docx | FileType::Xls | FileType::Xlsx | 
-            FileType::Ppt | FileType::Pptx | FileType::Odt => "Documentos",
-            
-            FileType::Zip | FileType::Rar | FileType::SevenZip | 
-            FileType::Tar | FileType::Gzip => "Archivos",
-            
-            FileType::Mp3 | FileType::Wav | FileType::Flac | FileType::Aac | FileType::Ogg | FileType::Wma => "Audio",
-            
-            FileType::Mp4 | FileType::Avi | FileType::MkV | FileType::Mov | 
-            FileType::Wmv | FileType::WebM | FileType::Flv => "Video",
-            
+            FileType::Jpeg
+            | FileType::Png
+            | FileType::Gif
+            | FileType::Bmp
+            | FileType::Tiff
+            | FileType::Webp
+            | FileType::Ico
+            | FileType::Heic
+            | FileType::Raw
+            | FileType::Psd
+            | FileType::Ai
+            | FileType::Svg => "Imágenes",
+
+            FileType::Pdf
+            | FileType::Doc
+            | FileType::Docx
+            | FileType::Xls
+            | FileType::Xlsx
+            | FileType::Ppt
+            | FileType::Pptx
+            | FileType::Odt => "Documentos",
+
+            FileType::Zip | FileType::Rar | FileType::SevenZip | FileType::Tar | FileType::Gzip => {
+                "Archivos"
+            }
+
+            FileType::Mp3
+            | FileType::Wav
+            | FileType::Flac
+            | FileType::Aac
+            | FileType::Ogg
+            | FileType::Wma => "Audio",
+
+            FileType::Mp4
+            | FileType::Avi
+            | FileType::MkV
+            | FileType::Mov
+            | FileType::Wmv
+            | FileType::WebM
+            | FileType::Flv => "Video",
+
             FileType::Exe | FileType::Dll | FileType::Msi => "Ejecutables",
-            
+
             FileType::Unknown => "Otros",
         }
     }
@@ -197,7 +223,7 @@ impl FileSignature {
         if data.len() < self.offset + self.magic_bytes.len() {
             return false;
         }
-        
+
         for (i, &byte) in self.magic_bytes.iter().enumerate() {
             if data[self.offset + i] != byte {
                 return false;
@@ -234,7 +260,12 @@ fn estimate_jpeg_size(data: &[u8]) -> Option<u64> {
 
 fn estimate_png_size(data: &[u8]) -> Option<u64> {
     for i in (8..data.len() - 7).rev() {
-        if &data[i..i + 4] == b"IEND" && data[i + 4] == 0xAE && data[i + 5] == 0x42 && data[i + 6] == 0x60 && data[i + 7] == 0x82 {
+        if &data[i..i + 4] == b"IEND"
+            && data[i + 4] == 0xAE
+            && data[i + 5] == 0x42
+            && data[i + 6] == 0x60
+            && data[i + 7] == 0x82
+        {
             return Some((i + 8) as u64);
         }
     }
@@ -251,9 +282,11 @@ fn estimate_gif_size(data: &[u8]) -> Option<u64> {
 }
 
 fn estimate_bmp_size(data: &[u8]) -> Option<u64> {
-    if data.len() >= 22 {
+    if data.len() >= 14 {
+        // En BMP el tamaño total está en el offset 2 (4 bytes LE)
         let size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as u64;
-        if size > 0 && size < u64::MAX {
+        // Validación básica: entre 100 bytes y 1GB
+        if size > 100 && size < 1_000_000_000 {
             return Some(size);
         }
     }
@@ -261,7 +294,9 @@ fn estimate_bmp_size(data: &[u8]) -> Option<u64> {
 }
 
 fn estimate_pdf_size(data: &[u8]) -> Option<u64> {
-    for i in (5..data.len() - 4).rev() {
+    // Buscar la marca %%EOF de atrás hacia adelante en los últimos 2048 bytes
+    let start_search = if data.len() > 2048 { data.len() - 2048 } else { 0 };
+    for i in (start_search..data.len().saturating_sub(5)).rev() {
         if &data[i..i + 5] == b"%%EOF" {
             return Some((i + 5) as u64);
         }
@@ -270,12 +305,18 @@ fn estimate_pdf_size(data: &[u8]) -> Option<u64> {
 }
 
 fn estimate_zip_size(data: &[u8]) -> Option<u64> {
-    if data.len() >= 22 {
-        for i in (data.len() - 22..data.len() - 4).rev() {
-            if data[i] == 0x50 && data[i + 1] == 0x4B && data[i + 2] == 0x05 && data[i + 3] == 0x06 {
-                let cd_size = u32::from_le_bytes([data[i + 12], data[i + 13], data[i + 14], data[i + 15]]) as u64;
-                let cd_offset = u32::from_le_bytes([data[i + 16], data[i + 17], data[i + 18], data[i + 19]]) as u64;
-                return Some(cd_offset + cd_size + 22);
+    // Para archivos ZIP (y Office Open XML), buscamos el End of Central Directory Record (EOCD)
+    // El EOCD empieza con 0x06054b50 y mide al menos 22 bytes.
+    for i in (0..data.len().saturating_sub(22)).rev() {
+        if data[i] == 0x50 && data[i + 1] == 0x4B && data[i + 2] == 0x05 && data[i + 3] == 0x06 {
+            // Tamaño del Central Directory + Offset del Central Directory + Tamaño del EOCD
+            let cd_size = u32::from_le_bytes([data[i + 12], data[i + 13], data[i + 14], data[i + 15]]) as u64;
+            let cd_offset = u32::from_le_bytes([data[i + 16], data[i + 17], data[i + 18], data[i + 19]]) as u64;
+            let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as u64;
+            
+            let total_size = cd_offset + cd_size + 22 + comment_len;
+            if total_size > 0 && total_size < 10_000_000_000 {
+                return Some(total_size);
             }
         }
     }
@@ -294,7 +335,8 @@ fn estimate_mp3_size(data: &[u8]) -> Option<u64> {
 fn estimate_mp4_size(data: &[u8]) -> Option<u64> {
     for i in (8..data.len() - 7).rev() {
         if &data[i..i + 4] == b"mdat" {
-            let box_size = u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as u64;
+            let box_size =
+                u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as u64;
             if box_size > 0 {
                 return Some(box_size);
             }
@@ -370,7 +412,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 50,
             max_size: Some(10_000_000),
         },
-        
         // Documentos
         FileSignature {
             file_type: FileType::Pdf,
@@ -400,7 +441,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(1_000_000_000),
         },
-        
         // Archivos comprimidos
         FileSignature {
             file_type: FileType::Zip,
@@ -451,7 +491,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(10_000_000_000),
         },
-        
         // Audio
         FileSignature {
             file_type: FileType::Mp3,
@@ -495,11 +534,24 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(2_000_000_000),
         },
-        
-        // Video
+        // Video - Firmas específicas para evitar falsos positivos
         FileSignature {
             file_type: FileType::Mp4,
-            magic_bytes: &[0x00, 0x00, 0x00],
+            magic_bytes: &[0x00, 0x00, 0x00, 0x1C, 0x66, 0x74, 0x79, 0x70],  // ft y isom
+            offset: 4,
+            min_size: 100,
+            max_size: Some(50_000_000_000),
+        },
+        FileSignature {
+            file_type: FileType::Mp4,
+            magic_bytes: &[0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70],  // ft isom
+            offset: 4,
+            min_size: 100,
+            max_size: Some(50_000_000_000),
+        },
+        FileSignature {
+            file_type: FileType::Mp4,
+            magic_bytes: &[0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70],  // ft isom
             offset: 4,
             min_size: 100,
             max_size: Some(50_000_000_000),
@@ -520,7 +572,14 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
         },
         FileSignature {
             file_type: FileType::Mov,
-            magic_bytes: &[0x00, 0x00, 0x00],
+            magic_bytes: &[0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70],  // qt   brand
+            offset: 4,
+            min_size: 100,
+            max_size: Some(50_000_000_000),
+        },
+        FileSignature {
+            file_type: FileType::Mov,
+            magic_bytes: &[0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70],  // qt   brand
             offset: 4,
             min_size: 100,
             max_size: Some(50_000_000_000),
@@ -539,7 +598,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(50_000_000_000),
         },
-        
         // Ejecutables
         FileSignature {
             file_type: FileType::Exe,
@@ -562,7 +620,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(2_000_000_000),
         },
-        
         // Más formatos de video
         FileSignature {
             file_type: FileType::Flv,
@@ -571,7 +628,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(10_000_000_000),
         },
-        
         // Más formatos de audio
         FileSignature {
             file_type: FileType::Wma,
@@ -580,7 +636,6 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(1_000_000_000),
         },
-        
         // RAW formatos de cámara
         FileSignature {
             file_type: FileType::Raw,

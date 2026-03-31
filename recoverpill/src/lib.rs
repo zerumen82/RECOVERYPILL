@@ -10,6 +10,7 @@ pub mod disk;
 pub mod core;
 pub mod ai;
 pub mod ui;
+pub mod build_info;
 
 pub use disk::drive_info::DriveInfo;
 pub use core::scanner::ScanResult;

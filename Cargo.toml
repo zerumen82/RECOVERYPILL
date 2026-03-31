@@ -1,0 +1,10 @@
+[workspace]
+members = ["recoverpill"]
+resolver = "2"
+
+[package]
+name = "HDRECOVER"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

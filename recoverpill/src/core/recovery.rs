@@ -1,11 +1,11 @@
 //! Motor de recuperación de archivos
-//! 
+//!
 //! Implementa las funciones para recuperar archivos del disco.
 
+use log::{error, info, warn};
 use std::fs::{self, File};
-use std::io::{Write, Read};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use log::{info, warn, error};
 
 use crate::core::scanner::FoundFile;
 use crate::disk::access::DiskReader;
@@ -23,62 +23,331 @@ impl RecoveryEngine {
             fs::create_dir_all(output_dir)
                 .map_err(|e| format!("Error al crear directorio de salida: {}", e))?;
         }
-        
+
         info!("Motor de recuperación inicializado en: {:?}", output_dir);
-        
+
         Ok(RecoveryEngine {
             output_dir: output_dir.to_path_buf(),
         })
     }
 
-    /// Recupera un archivo del disco
+    /// Recupera un archivo del disco de forma eficiente mediante streaming (bloques de 1MB)
     pub fn recover_file(
         &self,
         reader: &mut DiskReader,
         found_file: &FoundFile,
     ) -> Result<PathBuf, String> {
-        // Crear nombre de archivo
+        let extension = found_file.file_type.extension();
         let file_name = format!(
             "{}_{}.{}",
             found_file.file_type.extension().to_uppercase(),
-            found_file.offset / 1024, // Usar offset como identificador
-            found_file.file_type.extension()
+            found_file.offset / 1024,
+            extension
         );
-        
-        // Determinar directorio por tipo
+
         let category_dir = self.output_dir.join(found_file.file_type.category());
         if !category_dir.exists() {
-            fs::create_dir_all(&category_dir)
-                .map_err(|e| format!("Error al crear directorio de categoría: {}", e))?;
+            let _ = fs::create_dir_all(&category_dir);
         }
-        
+
         let file_path = category_dir.join(&file_name);
         
-        // Leer datos del disco
-        let size = if found_file.estimated_size > 0 {
-            found_file.estimated_size as usize
-        } else {
-            // Tamaño por defecto si no se puede estimar
-            64 * 1024 // 64KB
-        };
-        
-        let data = reader.read_at(found_file.offset, size)
-            .map_err(|e| format!("Error al leer datos del archivo: {}", e))?;
-        
-        if data.is_empty() {
-            return Err("No se pudieron leer datos del archivo".to_string());
-        }
-        
-        // Escribir archivo
+        // Abrir archivo de destino
         let mut file = File::create(&file_path)
-            .map_err(|e| format!("Error al crear archivo: {}", e))?;
+            .map_err(|e| format!("Error al crear archivo de salida: {}", e))?;
+
+        // Determinar límite máximo basado en el tipo o tamaño estimado
+        let mut total_to_read = self.calculate_read_size(found_file) as u64;
+        let mut offset = found_file.offset;
+        let mut bytes_written = 0u64;
         
-        file.write_all(&data)
-            .map_err(|e| format!("Error al escribir archivo: {}", e))?;
-        
-        info!("Archivo recuperado: {:?}", file_path);
-        
+        // Bloque de lectura óptimo (1MB)
+        let chunk_size = 1024 * 1024;
+        let mut buffer = vec![0u8; chunk_size];
+
+        while bytes_written < total_to_read {
+            let remaining = total_to_read - bytes_written;
+            let current_read = std::cmp::min(chunk_size as u64, remaining) as usize;
+            
+            // Intento de lectura con gestión de errores
+            match reader.read_at(offset, current_read) {
+                Ok(data) => {
+                    if data.is_empty() { break; }
+                    
+                    // Si es el primer bloque, podemos validar el header
+                    if bytes_written == 0 && !self.validate_file_data(&data, found_file.file_type) {
+                        warn!("Cabecera de archivo no coincide para {:?}", file_name);
+                    }
+
+                    // Escribir bloque al disco inmediatamente
+                    file.write_all(&data).map_err(|e| format!("Error escribiendo datos: {}", e))?;
+                    
+                    let data_len = data.len() as u64;
+                    bytes_written += data_len;
+                    offset += data_len;
+
+                    // Si el bloque leído es menor de lo pedido, fin de datos
+                    if (data_len as usize) < current_read { break; }
+                }
+                Err(e) => {
+                    error!("Error de lectura en offset {}: {}. Saltando bloque.", offset, e);
+                    // Rellenar con ceros para mantener la alineación del archivo
+                    let zeros = vec![0u8; current_read];
+                    file.write_all(&zeros).map_err(|e| format!("Error escribiendo ceros: {}", e))?;
+                    bytes_written += current_read as u64;
+                    offset += current_read as u64;
+                }
+            }
+        }
+
+        info!("Archivo recuperado: {:?} ({} MB)", file_name, bytes_written / 1024 / 1024);
         Ok(file_path)
+    }
+
+    /// Calcula el tamaño de lectura basado en el tipo de archivo
+    fn calculate_read_size(&self, found_file: &FoundFile) -> usize {
+        use crate::core::signatures::FileType;
+
+        // Si tenemos un tamaño estimado válido, usarlo
+        if found_file.estimated_size > 0 {
+            return found_file.estimated_size as usize;
+        }
+
+        // Tamaños máximos razonables por tipo de archivo
+        match found_file.file_type {
+            FileType::Jpeg | FileType::Png | FileType::Gif | FileType::Webp => 25 * 1024 * 1024, // 25MB
+            FileType::Bmp | FileType::Tiff | FileType::Raw | FileType::Psd => 100 * 1024 * 1024, // 100MB
+            
+            FileType::Mp4 | FileType::Avi | FileType::MkV | FileType::Mov | FileType::Wmv => 1024 * 1024 * 1024, // 1GB
+            
+            FileType::Mp3 | FileType::Wav | FileType::Flac | FileType::Ogg => 50 * 1024 * 1024, // 50MB
+            
+            FileType::Pdf | FileType::Doc | FileType::Docx | FileType::Xls | FileType::Xlsx => 50 * 1024 * 1024, // 50MB
+            
+            FileType::Zip | FileType::Rar | FileType::SevenZip => 500 * 1024 * 1024, // 500MB (Límite de seguridad)
+            
+            FileType::Exe | FileType::Msi => 200 * 1024 * 1024, // 200MB
+            
+            FileType::Unknown => 10 * 1024 * 1024, // 10MB
+            _ => 50 * 1024 * 1024,
+        }
+    }
+
+    /// Busca el final real del archivo para formatos conocidos
+    fn find_file_end(&self, data: &[u8], file_type: crate::core::signatures::FileType) -> Vec<u8> {
+        use crate::core::signatures::FileType;
+
+        if data.is_empty() {
+            return data.to_vec();
+        }
+
+        match file_type {
+            // JPEG: buscar FFD9 (End of Image)
+            FileType::Jpeg => {
+                for i in 0..data.len().saturating_sub(1) {
+                    if data[i] == 0xFF && data[i + 1] == 0xD9 {
+                        return data[..=i + 1].to_vec();
+                    }
+                }
+                // Si no se encuentra EOF, devolver todos los datos
+                data.to_vec()
+            }
+
+            // PNG: buscar IEND
+            FileType::Png => {
+                let iend_marker = b"IEND";
+                for i in 0..data.len().saturating_sub(4) {
+                    if &data[i..i + 4] == iend_marker {
+                        // IEND chunk tiene 12 bytes (4 length + 4 type + 4 CRC)
+                        let end_pos = std::cmp::min(i + 12, data.len());
+                        return data[..end_pos].to_vec();
+                    }
+                }
+                data.to_vec()
+            }
+
+            // GIF: buscar 00 3B (Trailer)
+            FileType::Gif => {
+                for i in 0..data.len().saturating_sub(1) {
+                    if data[i] == 0x00 && data[i + 1] == 0x3B {
+                        return data[..=i + 1].to_vec();
+                    }
+                }
+                data.to_vec()
+            }
+
+            // BMP: buscar final basado en el tamaño del archivo en el header
+            FileType::Bmp => {
+                if data.len() >= 14 {
+                    // El tamaño del archivo está en bytes 2-5 (little endian)
+                    let file_size =
+                        u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+                    if file_size > 0 && file_size <= data.len() {
+                        return data[..file_size].to_vec();
+                    }
+                }
+                data.to_vec()
+            }
+
+            // TIFF: buscar final basado en el último IFD
+            FileType::Tiff => {
+                // TIFF es complejo, devolver todos los datos por ahora
+                data.to_vec()
+            }
+
+            // MP4/MOV: buscar moov atom
+            FileType::Mp4 | FileType::Mov => {
+                let moov_marker = b"moov";
+                for i in 0..data.len().saturating_sub(4) {
+                    if &data[i..i + 4] == moov_marker {
+                        // Buscar el final del átomo moov
+                        if i + 8 < data.len() {
+                            let atom_size = u32::from_be_bytes([
+                                data[i - 4],
+                                data[i - 3],
+                                data[i - 2],
+                                data[i - 1],
+                            ]) as usize;
+                            let end_pos = std::cmp::min(i - 4 + atom_size, data.len());
+                            return data[..end_pos].to_vec();
+                        }
+                    }
+                }
+                data.to_vec()
+            }
+
+            // AVI: buscar final basado en el header
+            FileType::Avi => {
+                if data.len() >= 12 {
+                    // AVI tiene el tamaño del archivo en bytes 4-7
+                    let file_size =
+                        u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                    if file_size > 0 && file_size <= data.len() {
+                        return data[..file_size].to_vec();
+                    }
+                }
+                data.to_vec()
+            }
+
+            // MKV/WebM: buscar Cluster final
+            FileType::MkV | FileType::WebM => {
+                // MKV es complejo, buscar el último cluster
+                let cluster_marker = &[0x1F, 0x43, 0xB6, 0x75]; // Cluster ID
+                let mut last_cluster_pos = None;
+
+                for i in 0..data.len().saturating_sub(4) {
+                    if &data[i..i + 4] == cluster_marker {
+                        last_cluster_pos = Some(i);
+                    }
+                }
+
+                if let Some(pos) = last_cluster_pos {
+                    // Buscar el siguiente cluster o final
+                    for i in (pos + 4)..data.len().saturating_sub(4) {
+                        if &data[i..i + 4] == cluster_marker {
+                            return data[..i].to_vec();
+                        }
+                    }
+                }
+                data.to_vec()
+            }
+
+            // MP3: buscar último frame sync
+            FileType::Mp3 => {
+                let sync_marker = 0xFF;
+                let mut last_sync_pos = None;
+
+                for i in 0..data.len().saturating_sub(1) {
+                    if data[i] == sync_marker && (data[i + 1] & 0xE0) == 0xE0 {
+                        last_sync_pos = Some(i);
+                    }
+                }
+
+                if let Some(pos) = last_sync_pos {
+                    // Calcular el final del último frame (aproximadamente 4KB por frame)
+                    let end_pos = std::cmp::min(pos + 4096, data.len());
+                    return data[..end_pos].to_vec();
+                }
+                data.to_vec()
+            }
+
+            // WAV: buscar final basado en el header
+            FileType::Wav => {
+                if data.len() >= 44 {
+                    // WAV tiene el tamaño del archivo en bytes 4-7
+                    let file_size =
+                        u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                    if file_size > 0 && file_size <= data.len() {
+                        return data[..file_size].to_vec();
+                    }
+                }
+                data.to_vec()
+            }
+
+            // FLAC: buscar STREAMINFO block
+            FileType::Flac => {
+                if data.starts_with(b"fLaC") {
+                    // FLAC comienza con "fLaC", buscar el final del stream
+                    // Por simplicidad, devolver todos los datos
+                    data.to_vec()
+                } else {
+                    data.to_vec()
+                }
+            }
+
+            // PDF: buscar %%EOF
+            FileType::Pdf => {
+                let eof_marker = b"%%EOF";
+                let start = if data.len() >= 5 { data.len() - 5 } else { 0 };
+                for i in (start..data.len()).rev() {
+                    if &data[i..i + 5] == eof_marker {
+                        return data[..i + 5].to_vec();
+                    }
+                }
+                data.to_vec()
+            }
+
+            // Para otros formatos, devolver todos los datos
+            _ => data.to_vec(),
+        }
+    }
+
+    /// Valida que los datos del archivo son coherentes
+    fn validate_file_data(
+        &self,
+        data: &[u8],
+        file_type: crate::core::signatures::FileType,
+    ) -> bool {
+        use crate::core::signatures::FileType;
+
+        if data.len() < 4 {
+            return false;
+        }
+
+        match file_type {
+            FileType::Jpeg => {
+                // JPEG debe empezar con FFD8FF
+                data.starts_with(&[0xFF, 0xD8, 0xFF])
+            }
+            FileType::Png => {
+                // PNG debe empezar con 89504E47
+                data.starts_with(&[0x89, 0x50, 0x4E, 0x47])
+            }
+            FileType::Gif => {
+                // GIF debe empezar con GIF87a o GIF89a
+                data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")
+            }
+            FileType::Bmp => {
+                // BMP debe empezar con 424D
+                data.starts_with(&[0x42, 0x4D])
+            }
+            FileType::Webp => {
+                // WebP debe tener RIFF en inicio y WEBP en offset 8
+                data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP"
+            }
+            // Para otros formatos, asumir que son válidos si tienen datos
+            _ => !data.iter().all(|&b| b == 0),
+        }
     }
 
     /// Recupera múltiples archivos
@@ -88,8 +357,9 @@ impl RecoveryEngine {
         files: &[FoundFile],
     ) -> Vec<(FoundFile, Result<PathBuf, String>)> {
         info!("Iniciando recuperación de {} archivos", files.len());
-        
-        files.iter()
+
+        files
+            .iter()
             .map(|f| {
                 let result = self.recover_file(reader, f);
                 (f.clone(), result)
@@ -104,37 +374,45 @@ impl RecoveryEngine {
         files: &[FoundFile],
         file_type: crate::core::signatures::FileType,
     ) -> Vec<(FoundFile, Result<PathBuf, String>)> {
-        let filtered: Vec<FoundFile> = files.iter()
+        let filtered: Vec<FoundFile> = files
+            .iter()
             .filter(|f| f.file_type == file_type)
             .cloned()
             .collect();
-        
+
         self.recover_files(reader, &filtered)
     }
 
     /// Organiza los archivos recuperados en subdirectorios por tipo
-    pub fn organize_by_type(&self, files: &[PathBuf]) -> std::collections::HashMap<String, Vec<PathBuf>> {
-        let mut organized: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
-        
+    pub fn organize_by_type(
+        &self,
+        files: &[PathBuf],
+    ) -> std::collections::HashMap<String, Vec<PathBuf>> {
+        let mut organized: std::collections::HashMap<String, Vec<PathBuf>> =
+            std::collections::HashMap::new();
+
         for file_path in files {
             if let Some(ext) = file_path.extension() {
                 let ext_str = ext.to_string_lossy().to_lowercase();
                 let category = match ext_str.as_str() {
                     "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "webp" | "ico" => "Imágenes",
-                    "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" => "Documentos",
+                    "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" => {
+                        "Documentos"
+                    }
                     "zip" | "rar" | "7z" | "tar" | "gz" => "Archivos",
                     "mp3" | "wav" | "flac" | "aac" | "ogg" => "Audio",
                     "mp4" | "avi" | "mkv" | "mov" | "wmv" | "webm" => "Video",
                     "exe" | "dll" | "msi" => "Ejecutables",
                     _ => "Otros",
                 };
-                
-                organized.entry(category.to_string())
+
+                organized
+                    .entry(category.to_string())
                     .or_insert_with(Vec::new)
                     .push(file_path.clone());
             }
         }
-        
+
         organized
     }
 
@@ -146,10 +424,9 @@ impl RecoveryEngine {
     /// Establece un nuevo directorio de salida
     pub fn set_output_dir(&mut self, path: &Path) -> Result<(), String> {
         if !path.exists() {
-            fs::create_dir_all(path)
-                .map_err(|e| format!("Error al crear directorio: {}", e))?;
+            fs::create_dir_all(path).map_err(|e| format!("Error al crear directorio: {}", e))?;
         }
-        
+
         self.output_dir = path.to_path_buf();
         Ok(())
     }
@@ -163,26 +440,25 @@ pub fn read_raw_data(drive: &str, offset: u64, size: usize) -> Result<Vec<u8>, S
 
 /// Valida si un archivo tiene datos coherentes
 pub fn validate_recovered_file(path: &Path) -> Result<bool, String> {
-    let mut file = File::open(path)
-        .map_err(|e| format!("Error al abrir archivo: {}", e))?;
-    
+    let mut file = File::open(path).map_err(|e| format!("Error al abrir archivo: {}", e))?;
+
     let mut header = vec![0u8; 16];
     file.read_exact(&mut header)
         .map_err(|e| format!("Error al leer header: {}", e))?;
-    
+
     // Verificar si tiene magic bytes válidos
     Ok(!header.iter().all(|&b| b == 0))
 }
 
 /// Obtiene información de un archivo recuperado
 pub fn get_recovered_file_info(path: &Path) -> Result<RecoveredFileInfo, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|e| format!("Error al obtener metadatos: {}", e))?;
-    
-    let extension = path.extension()
+    let metadata = fs::metadata(path).map_err(|e| format!("Error al obtener metadatos: {}", e))?;
+
+    let extension = path
+        .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    
+
     Ok(RecoveredFileInfo {
         path: path.to_path_buf(),
         size: metadata.len(),
@@ -210,7 +486,7 @@ mod tests {
         let temp_dir = env::temp_dir().join("recoverpill_test");
         let engine = RecoveryEngine::new(&temp_dir);
         assert!(engine.is_ok());
-        
+
         // Limpiar
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -1,5 +1,5 @@
 //! Módulo de Inteligencia Artificial
-//! 
+//!
 //! Proporciona clasificación y análisis de archivos usando técnicas de IA.
 
 pub mod classifier;
