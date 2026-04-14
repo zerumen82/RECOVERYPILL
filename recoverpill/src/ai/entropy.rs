@@ -149,6 +149,58 @@ impl EntropyClass {
             EntropyClass::VeryHigh => "Posiblemente encriptado o muy comprimido",
         }
     }
+    
+    /// Retorna una etiqueta clara y amigable para la UI
+    pub fn ui_label(&self) -> &'static str {
+        match self {
+            EntropyClass::VeryLow => "Muy Simple",
+            EntropyClass::Low => "Simple",
+            EntropyClass::Medium => "Estructurado",
+            EntropyClass::High => "Complejo",
+            EntropyClass::VeryHigh => "Comprimido/Cifrado",
+        }
+    }
+    
+    /// Retorna un emoji descriptivo para la UI
+    pub fn ui_emoji(&self) -> &'static str {
+        match self {
+            EntropyClass::VeryLow => "📄",
+            EntropyClass::Low => "📝",
+            EntropyClass::Medium => "📦",
+            EntropyClass::High => "🖼️",
+            EntropyClass::VeryHigh => "🔒",
+        }
+    }
+    
+    /// Retorna un color sugerido para la UI (formato egui)
+    pub fn ui_color(&self) -> [f32; 3] {
+        match self {
+            EntropyClass::VeryLow => [0.6, 0.6, 0.6], // Gris
+            EntropyClass::Low => [0.3, 0.7, 0.3],     // Verde
+            EntropyClass::Medium => [0.9, 0.7, 0.2],  // Amarillo
+            EntropyClass::High => [0.2, 0.6, 1.0],    // Azul
+            EntropyClass::VeryHigh => [0.9, 0.3, 0.3], // Rojo
+        }
+    }
+}
+
+/// Retorna una descripción clara de la entropía para mostrar en la UI
+/// Reemplaza el valor numérico confuso con lenguaje descriptivo
+pub fn entropy_description(entropy_value: f64) -> &'static str {
+    let class = classify_entropy(entropy_value);
+    class.ui_label()
+}
+
+/// Retorna el emoji correspondiente al valor de entropía
+pub fn entropy_emoji(entropy_value: f64) -> &'static str {
+    let class = classify_entropy(entropy_value);
+    class.ui_emoji()
+}
+
+/// Retorna el color sugerido para el valor de entropía
+pub fn entropy_color(entropy_value: f64) -> [f32; 3] {
+    let class = classify_entropy(entropy_value);
+    class.ui_color()
 }
 
 /// Clasifica la entropía

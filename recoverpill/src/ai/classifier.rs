@@ -245,9 +245,32 @@ impl AIClassifier {
             confidence = 85.0;
         }
 
-        // Ajuste por tipo de archivo
+        // Ajuste por tipo de archivo y CALIDAD ESPECÍFICA (Mejora)
         match file_type {
-            FileType::Jpeg | FileType::Png | FileType::Gif | FileType::Bmp => {
+            FileType::Jpeg => {
+                // JPG debe empezar con FF D8
+                if data.len() > 4 && data[0] == 0xFF && data[1] == 0xD8 {
+                    probability += 10.0;
+                    // Si tiene marcadores de tablas (Quantization/Huffman), es muy probable que sea real
+                    if data.iter().take(2048).any(|&b| b == 0xDB || b == 0xC4) {
+                        probability += 5.0;
+                        confidence += 10.0;
+                    }
+                } else {
+                    probability -= 30.0;
+                    is_corrupted = true;
+                }
+            },
+            FileType::Png => {
+                if data.len() > 8 && &data[0..4] == b"\x89PNG" {
+                    probability += 15.0;
+                    confidence += 5.0;
+                } else {
+                    probability -= 40.0;
+                    is_corrupted = true;
+                }
+            },
+            FileType::Gif | FileType::Bmp => {
                 // Imágenes tienen buena tasa de recuperación
                 probability += 15.0;
                 confidence += 10.0;
@@ -269,6 +292,17 @@ impl AIClassifier {
             probability -= 30.0;
             is_corrupted = true;
             confidence -= 20.0;
+        }
+
+        // PENALIZACIÓN POR TAMAÑO (Ignorar basura/miniaturas si es imagen)
+        if matches!(file_type.category(), "Imágenes") {
+            if data.len() < 50_000 {
+                probability *= 0.7; // Reducir prioridad de miniaturas
+            }
+            if data.len() < 5_000 {
+                probability *= 0.5; // Muy baja prioridad para iconos/ruido
+                is_corrupted = true;
+            }
         }
 
         probability = probability.max(0.0).min(100.0);

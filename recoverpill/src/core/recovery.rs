@@ -10,6 +10,24 @@ use std::path::{Path, PathBuf};
 use crate::core::scanner::FoundFile;
 use crate::disk::access::DiskReader;
 
+/// Calcula un hash simple de los primeros bytes de un archivo para detección de duplicados
+/// Usamos los primeros 4KB para un balance entre precisión y velocidad
+pub fn calculate_content_hash(data: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    // Usar los primeros 4KB o menos si el archivo es pequeño
+    let hash_data = if data.len() > 4096 {
+        &data[..4096]
+    } else {
+        data
+    };
+    
+    let mut hasher = DefaultHasher::new();
+    hash_data.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 /// Motor de recuperación
 pub struct RecoveryEngine {
     output_dir: PathBuf,
@@ -39,9 +57,9 @@ impl RecoveryEngine {
     ) -> Result<PathBuf, String> {
         let extension = found_file.file_type.extension();
         let file_name = format!(
-            "{}_{}.{}",
+            "{}_0x{:X}.{}",
             found_file.file_type.extension().to_uppercase(),
-            found_file.offset / 1024,
+            found_file.offset,
             extension
         );
 
@@ -51,56 +69,61 @@ impl RecoveryEngine {
         }
 
         let file_path = category_dir.join(&file_name);
-        
-        // Abrir archivo de destino
-        let mut file = File::create(&file_path)
-            .map_err(|e| format!("Error al crear archivo de salida: {}", e))?;
 
-        // Determinar límite máximo basado en el tipo o tamaño estimado
-        let mut total_to_read = self.calculate_read_size(found_file) as u64;
-        let mut offset = found_file.offset;
-        let mut bytes_written = 0u64;
+        // Determinar tamaño a leer
+        let total_to_read = self.calculate_read_size(found_file) as usize;
         
-        // Bloque de lectura óptimo (1MB)
-        let chunk_size = 1024 * 1024;
-        let mut buffer = vec![0u8; chunk_size];
-
-        while bytes_written < total_to_read {
-            let remaining = total_to_read - bytes_written;
-            let current_read = std::cmp::min(chunk_size as u64, remaining) as usize;
-            
-            // Intento de lectura con gestión de errores
-            match reader.read_at(offset, current_read) {
+        // Para archivos pequeños (< 1MB), leer todo de una vez
+        if total_to_read <= 1024 * 1024 {
+            match reader.read_at(found_file.offset, total_to_read) {
                 Ok(data) => {
-                    if data.is_empty() { break; }
-                    
-                    // Si es el primer bloque, podemos validar el header
-                    if bytes_written == 0 && !self.validate_file_data(&data, found_file.file_type) {
-                        warn!("Cabecera de archivo no coincide para {:?}", file_name);
+                    if !data.is_empty() {
+                        fs::write(&file_path, &data)
+                            .map_err(|e| format!("Error al escribir archivo: {}", e))?;
+                        return Ok(file_path);
                     }
-
-                    // Escribir bloque al disco inmediatamente
-                    file.write_all(&data).map_err(|e| format!("Error escribiendo datos: {}", e))?;
-                    
-                    let data_len = data.len() as u64;
-                    bytes_written += data_len;
-                    offset += data_len;
-
-                    // Si el bloque leído es menor de lo pedido, fin de datos
-                    if (data_len as usize) < current_read { break; }
                 }
                 Err(e) => {
-                    error!("Error de lectura en offset {}: {}. Saltando bloque.", offset, e);
-                    // Rellenar con ceros para mantener la alineación del archivo
-                    let zeros = vec![0u8; current_read];
-                    file.write_all(&zeros).map_err(|e| format!("Error escribiendo ceros: {}", e))?;
-                    bytes_written += current_read as u64;
-                    offset += current_read as u64;
+                    warn!("Error leyendo archivo pequeño: {}", e);
                 }
             }
         }
 
-        info!("Archivo recuperado: {:?} ({} MB)", file_name, bytes_written / 1024 / 1024);
+        // Para archivos grandes, usar streaming con buffer reutilizado
+        let mut file = File::create(&file_path)
+            .map_err(|e| format!("Error al crear archivo de salida: {}", e))?;
+
+        let mut offset = found_file.offset;
+        let mut bytes_written = 0usize;
+
+        // Buffer optimizado de 4MB para mejor rendimiento en discos modernos
+        let chunk_size = 4 * 1024 * 1024; // 4MB
+        let mut buffer = vec![0u8; chunk_size];
+
+        while bytes_written < total_to_read {
+            let remaining = total_to_read - bytes_written;
+            let current_read = std::cmp::min(chunk_size, remaining);
+
+            match reader.read_at(offset, current_read) {
+                Ok(data) => {
+                    if data.is_empty() { break; }
+
+                    file.write_all(&data)
+                        .map_err(|e| format!("Error escribiendo datos: {}", e))?;
+
+                    bytes_written += data.len();
+                    offset += data.len() as u64;
+
+                    if data.len() < current_read { break; }
+                }
+                Err(e) => {
+                    warn!("Error de lectura en offset {}: {}. Saltando.", offset, e);
+                    break;
+                }
+            }
+        }
+
+        info!("Archivo recuperado: {:?} ({} bytes)", file_name, bytes_written);
         Ok(file_path)
     }
 
@@ -327,25 +350,59 @@ impl RecoveryEngine {
         match file_type {
             FileType::Jpeg => {
                 // JPEG debe empezar con FFD8FF
-                data.starts_with(&[0xFF, 0xD8, 0xFF])
+                if !data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                    return false;
+                }
+                // Intentar decodificar para verificar integridad
+                image::load_from_memory(data).is_ok()
             }
             FileType::Png => {
                 // PNG debe empezar con 89504E47
-                data.starts_with(&[0x89, 0x50, 0x4E, 0x47])
+                if !data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                    return false;
+                }
+                // Intentar decodificar para verificar integridad
+                image::load_from_memory(data).is_ok()
             }
             FileType::Gif => {
                 // GIF debe empezar con GIF87a o GIF89a
-                data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")
+                if !data.starts_with(b"GIF87a") && !data.starts_with(b"GIF89a") {
+                    return false;
+                }
+                // Intentar decodificar para verificar integridad
+                image::load_from_memory(data).is_ok()
             }
             FileType::Bmp => {
                 // BMP debe empezar con 424D
-                data.starts_with(&[0x42, 0x4D])
+                if !data.starts_with(&[0x42, 0x4D]) {
+                    return false;
+                }
+                // Intentar decodificar para verificar integridad
+                image::load_from_memory(data).is_ok()
             }
             FileType::Webp => {
                 // WebP debe tener RIFF en inicio y WEBP en offset 8
-                data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP"
+                if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+                    return false;
+                }
+                // Intentar decodificar para verificar integridad
+                image::load_from_memory(data).is_ok()
             }
-            // Para otros formatos, asumir que son válidos si tienen datos
+            // Para otros formatos, validar con magic bytes
+            FileType::Pdf => {
+                data.starts_with(&[0x25, 0x50, 0x44, 0x46]) // %PDF
+            }
+            FileType::Zip | FileType::Docx | FileType::Xlsx | FileType::Pptx => {
+                // ZIP y Office files: validar signature
+                data.starts_with(&[0x50, 0x4B, 0x03, 0x04])
+            }
+            FileType::Rar => {
+                data.starts_with(&[0x52, 0x61, 0x72, 0x21])
+            }
+            FileType::SevenZip => {
+                data.starts_with(&[0x37, 0x7A, 0xBC, 0xAF])
+            }
+            // Para otros formatos, al menos verificar que no estén vacíos
             _ => !data.iter().all(|&b| b == 0),
         }
     }
@@ -358,6 +415,7 @@ impl RecoveryEngine {
     ) -> Vec<(FoundFile, Result<PathBuf, String>)> {
         info!("Iniciando recuperación de {} archivos", files.len());
 
+        // Recuperar archivos secuencialmente (paralelización limitada por acceso al disco)
         files
             .iter()
             .map(|f| {

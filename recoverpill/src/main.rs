@@ -68,11 +68,15 @@ fn main() {
         build_info::BUILD_TIMESTAMP
     );
 
+    // Load window icon from embedded resource
+    let icon_data = load_window_icon();
+
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title(&title),
+            .with_title(&title)
+            .with_icon(icon_data),
         ..Default::default()
     };
 
@@ -83,5 +87,50 @@ fn main() {
     ) {
         error!("Error al iniciar la aplicación: {}", e);
         std::process::exit(1);
+    }
+}
+
+/// Load window icon from the embedded capsule icon
+fn load_window_icon() -> egui::IconData {
+    // The icon is embedded via Windows resources, so we load it from file for the window
+    let icon_path = "capsule.ico";
+    
+    // Try to load from file first (for development)
+    if let Ok(bytes) = std::fs::read(icon_path) {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            return egui::IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            };
+        }
+    }
+    
+    // Fallback: create a simple default icon
+    create_default_icon()
+}
+
+/// Create a simple default icon as fallback
+fn create_default_icon() -> egui::IconData {
+    let size = 32u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    
+    // Fill with blue color
+    for y in 0..size {
+        for x in 0..size {
+            let idx = ((y * size + x) * 4) as usize;
+            rgba[idx] = 30;      // R
+            rgba[idx + 1] = 144; // G
+            rgba[idx + 2] = 255; // B
+            rgba[idx + 3] = 255; // A
+        }
+    }
+    
+    egui::IconData {
+        rgba,
+        width: size,
+        height: size,
     }
 }

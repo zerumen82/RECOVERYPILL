@@ -6,6 +6,7 @@ use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::ai::entropy::{entropy_description, entropy_emoji, entropy_color};
 use crate::build_info::BUILD_DATE;
 use crate::core::scanner::{FoundFile, ScanProgress, Scanner};
 use crate::core::signatures::get_categories;
@@ -48,6 +49,8 @@ pub struct RecoverPillApp {
     enabled_filters: Vec<String>,
     all_filters_enabled: bool,
     type_filter: Option<String>,
+    selected_individual_types: std::collections::HashSet<String>,
+    show_individual_types: bool,
     console_messages: Vec<ConsoleMessage>,
     selected_file: Option<usize>,
     preview_data: Option<Vec<u8>>,
@@ -60,6 +63,9 @@ pub struct RecoverPillApp {
     preview_receiver: Option<std::sync::mpsc::Receiver<PreviewResult>>,
     last_drive_path: Option<String>,
     filter_text: String,
+    quality_filter_enabled: bool,
+    hide_duplicates: bool,
+    min_recoverability: f64,
     sort_by: SortOption,
     sort_ascending: bool,
     current_page: usize,
@@ -135,6 +141,8 @@ impl RecoverPillApp {
             enabled_filters,
             all_filters_enabled: true,
             type_filter: None,
+            selected_individual_types: std::collections::HashSet::new(),
+            show_individual_types: false,
             console_messages: vec![ConsoleMessage {
                 text: format!("recoverPill v1.0.0 listo (Compilado: {})", BUILD_DATE),
                 level: ConsoleLevel::Info,
@@ -150,6 +158,9 @@ impl RecoverPillApp {
             preview_receiver: None,
             last_drive_path: None,
             filter_text: String::new(),
+            quality_filter_enabled: false,
+            hide_duplicates: true, // Por defecto ocultar duplicados
+            min_recoverability: 70.0,
             output_folder: String::new(),
             sort_by: SortOption::Recoverability,
             sort_ascending: false,
@@ -165,6 +176,60 @@ impl RecoverPillApp {
         if self.console_messages.len() > 100 {
             self.console_messages.remove(0);
         }
+    }
+
+    fn get_current_type_filters(&self) -> Option<Vec<crate::core::signatures::FileType>> {
+        use crate::core::signatures::FileType;
+        self.type_filter.as_ref().map(|filter| {
+            filter.split(',')
+                .filter_map(|ext| {
+                    match ext.trim().to_lowercase().as_str() {
+                        "jpg" | "jpeg" => Some(FileType::Jpeg),
+                        "png" => Some(FileType::Png),
+                        "gif" => Some(FileType::Gif),
+                        "bmp" => Some(FileType::Bmp),
+                        "webp" => Some(FileType::Webp),
+                        "heic" => Some(FileType::Heic),
+                        "raw" => Some(FileType::Raw),
+                        "tiff" => Some(FileType::Tiff),
+                        "ico" => Some(FileType::Ico),
+                        "psd" => Some(FileType::Psd),
+                        "ai" => Some(FileType::Ai),
+                        "svg" => Some(FileType::Svg),
+                        "mp3" => Some(FileType::Mp3),
+                        "wav" => Some(FileType::Wav),
+                        "flac" => Some(FileType::Flac),
+                        "aac" => Some(FileType::Aac),
+                        "ogg" => Some(FileType::Ogg),
+                        "wma" => Some(FileType::Wma),
+                        "mp4" => Some(FileType::Mp4),
+                        "avi" => Some(FileType::Avi),
+                        "mkv" => Some(FileType::MkV),
+                        "mov" => Some(FileType::Mov),
+                        "wmv" => Some(FileType::Wmv),
+                        "webm" => Some(FileType::WebM),
+                        "flv" => Some(FileType::Flv),
+                        "pdf" => Some(FileType::Pdf),
+                        "doc" => Some(FileType::Doc),
+                        "docx" => Some(FileType::Docx),
+                        "xls" => Some(FileType::Xls),
+                        "xlsx" => Some(FileType::Xlsx),
+                        "ppt" => Some(FileType::Ppt),
+                        "pptx" => Some(FileType::Pptx),
+                        "odt" => Some(FileType::Odt),
+                        "zip" => Some(FileType::Zip),
+                        "rar" => Some(FileType::Rar),
+                        "7z" => Some(FileType::SevenZip),
+                        "tar" => Some(FileType::Tar),
+                        "gz" => Some(FileType::Gzip),
+                        "exe" => Some(FileType::Exe),
+                        "dll" => Some(FileType::Dll),
+                        "msi" => Some(FileType::Msi),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
     }
 
     fn start_scan(&mut self) {
@@ -206,6 +271,15 @@ impl RecoverPillApp {
             format!("🚀 Iniciando {} de {}...", mode_text, drive_path),
             ConsoleLevel::Info,
         );
+        
+        let type_filters = self.get_current_type_filters();
+        if let Some(ref filters) = type_filters {
+            self.add_console_message(
+                format!("🔍 Filtrando por {} tipos de archivo", filters.len()),
+                ConsoleLevel::Info,
+            );
+        }
+
         self.add_console_message(
             format!(
                 "💾 Tamaño de unidad: {} ({})",
@@ -246,6 +320,7 @@ impl RecoverPillApp {
         self.progress_receiver = Some(progress_rx);
 
         let should_stop = self.should_stop.clone();
+        let min_recoverability = self.min_recoverability;
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || match Scanner::new(&drive_path) {
@@ -265,7 +340,7 @@ impl RecoverPillApp {
 
                 let progress_tx_clone = progress_tx.clone();
                 let result = match scan_mode {
-                    ScanMode::Signature => scanner.scan_with_progress(move |msg| {
+                    ScanMode::Signature => scanner.scan_with_progress(type_filters, min_recoverability, move |msg| {
                         let _ = progress_tx_clone.send(msg);
                     }),
                     ScanMode::FileSystem => scanner.scan_filesystem(move |msg| {
@@ -275,9 +350,6 @@ impl RecoverPillApp {
 
                 // Enviar resultado inmediatamente, sin esperar stop_watcher
                 let _ = tx.send(Ok(result));
-
-                // El stop_watcher se detendrá solo cuando should_stop sea true
-                // o cuando el proceso termine
             }
             Err(e) => {
                 let _ = tx.send(Err(e));
@@ -401,17 +473,30 @@ impl RecoverPillApp {
 
     fn select_by_category(&mut self, category: &str) {
         let mut count = 0;
+        let min_quality = if self.quality_filter_enabled { self.min_recoverability } else { 0.0 };
+        
         for file in &mut self.found_files {
+            // Deseleccionar todo primero
+            file.selected = false;
+            
             let file_category = file.file_type.category();
-            if file_category == category {
+            if file_category == category && file.recoverability >= min_quality {
                 file.selected = true;
                 count += 1;
             }
         }
-        self.add_console_message(
-            format!("✅ {} archivos de {} seleccionados", count, category),
-            ConsoleLevel::Success,
-        );
+        
+        if self.quality_filter_enabled {
+            self.add_console_message(
+                format!("✅ {} archivos de {} con calidad >= {:.0}% seleccionados", count, category, self.min_recoverability),
+                ConsoleLevel::Success,
+            );
+        } else {
+            self.add_console_message(
+                format!("✅ {} archivos de {} seleccionados", count, category),
+                ConsoleLevel::Success,
+            );
+        }
     }
 
     fn toggle_file_selection(&mut self, index: usize) {
@@ -421,13 +506,42 @@ impl RecoverPillApp {
     }
 
     fn select_all(&mut self) {
+        let mut count = 0;
+        let filter_text = self.filter_text.to_lowercase();
+        let type_pattern = self.type_filter.clone();
+        let min_quality = if self.quality_filter_enabled { self.min_recoverability } else { 0.0 };
+
         for file in &mut self.found_files {
-            file.selected = true;
+            // Primero deseleccionar todo
+            file.selected = false;
+            
+            // Verificar si el archivo pasaría los filtros actuales
+            let text_match = filter_text.is_empty() 
+                || file.file_name.to_lowercase().contains(&filter_text)
+                || file.file_type.extension().to_lowercase().contains(&filter_text);
+                
+            let type_match = if let Some(ref pattern) = type_pattern {
+                let ext = file.file_type.extension().to_lowercase();
+                pattern.split(',').any(|p| p.trim().to_lowercase() == ext)
+            } else {
+                true
+            };
+            
+            let quality_match = file.recoverability >= min_quality;
+
+            if text_match && type_match && quality_match {
+                file.selected = true;
+                count += 1;
+            }
         }
-        self.add_console_message(
-            "Todos los archivos seleccionados".to_string(),
-            ConsoleLevel::Info,
-        );
+
+        let msg = if count > 0 {
+            format!("✅ Seleccionados {} archivos (respetando filtros actuales)", count)
+        } else {
+            "No hay archivos que coincidan con los filtros para seleccionar".to_string()
+        };
+        
+        self.add_console_message(msg, ConsoleLevel::Success);
     }
 
     fn deselect_all(&mut self) {
@@ -457,16 +571,21 @@ impl RecoverPillApp {
     }
 
     fn recover_selected_files(&mut self) {
-        let selected_count = self.found_files.iter().filter(|f| f.selected).count();
         let output_folder = self.output_folder.clone();
         let drive_idx = self.selected_drive;
 
+        // Obtener filtro de calidad activo
+        let min_quality = if self.quality_filter_enabled { self.min_recoverability } else { 0.0 };
+
+        // Filtrar archivos seleccionados por calidad
         let files_to_recover: Vec<_> = self
             .found_files
             .iter()
-            .filter(|f| f.selected)
+            .filter(|f| f.selected && f.recoverability >= min_quality)
             .map(|f| (f.offset, f.file_type.clone(), f.estimated_size))
             .collect();
+
+        let selected_count = files_to_recover.len();
 
         if selected_count == 0 {
             self.add_console_message(
@@ -568,6 +687,10 @@ impl RecoverPillApp {
                     entropy: 0.0,
                     signature_matched: String::new(),
                     selected: false,
+                    is_validated: false,
+                    content_hash: None,
+                    is_duplicate: false,
+                    duplicate_group: None,
                 };
 
                 let _ = progress_tx.send(format!(
@@ -1196,10 +1319,11 @@ impl App for RecoverPillApp {
                                 ("IMG", "jpg,jpeg,png,gif,bmp,webp,heic,raw", "Imágenes"),
                                 ("VID", "mp4,avi,mkv,mov,wmv", "Videos"),
                                 ("DOC", "pdf,doc,docx,xls,xlsx", "Docs"),
+                                ("ZIP", "zip,rar,7z,tar,gz", "Comprimidos"),
                             ];
                             for (label, pattern, tooltip) in types {
                                 let is_active = self.type_filter.as_deref() == Some(pattern)
-                                    || (pattern.is_empty() && self.type_filter.is_none());
+                                    || (pattern.is_empty() && self.type_filter.is_none() && !self.show_individual_types);
                                 let btn = egui::Button::new(
                                     egui::RichText::new(label).size(11.0).color(if is_active {
                                         egui::Color32::WHITE
@@ -1214,6 +1338,7 @@ impl App for RecoverPillApp {
                                 })
                                 .min_size(egui::vec2(35.0, 22.0));
                                 if ui.add(btn).on_hover_text(tooltip).clicked() {
+                                    self.show_individual_types = false;
                                     if pattern.is_empty() {
                                         self.type_filter = None;
                                     } else {
@@ -1221,8 +1346,134 @@ impl App for RecoverPillApp {
                                     }
                                 }
                             }
+                            // Botón para activar selección individual
+                            let custom_btn = egui::Button::new(
+                                egui::RichText::new("⚙️").size(11.0).color(if self.show_individual_types {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_gray(180)
+                                }),
+                            )
+                            .fill(if self.show_individual_types {
+                                ACCENT_COLOR
+                            } else {
+                                egui::Color32::from_gray(50)
+                            })
+                            .min_size(egui::vec2(35.0, 22.0));
+                            if ui.add(custom_btn).on_hover_text("Seleccionar tipos individuales").clicked() {
+                                self.show_individual_types = !self.show_individual_types;
+                            }
                         });
-                        ui.add_space(6.0);
+                        
+                        // Selección individual de tipos de archivo
+                        if self.show_individual_types {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(5.0);
+                            
+                            // Categorías de tipos de archivo
+                            let image_types = vec![
+                                ("jpg", "JPG"), ("jpeg", "JPEG"), ("png", "PNG"), ("gif", "GIF"),
+                                ("bmp", "BMP"), ("webp", "WebP"), ("heic", "HEIC"), ("raw", "RAW"),
+                                ("tiff", "TIFF"), ("ico", "ICO"), ("psd", "PSD"), ("ai", "AI"),
+                                ("svg", "SVG"),
+                            ];
+                            let video_types = vec![
+                                ("mp4", "MP4"), ("avi", "AVI"), ("mkv", "MKV"), ("mov", "MOV"), 
+                                ("wmv", "WMV"), ("webm", "WebM"), ("flv", "FLV"),
+                            ];
+                            let doc_types = vec![
+                                ("pdf", "PDF"), ("doc", "DOC"), ("docx", "DOCX"), 
+                                ("xls", "XLS"), ("xlsx", "XLSX"), ("ppt", "PPT"), 
+                                ("pptx", "PPTX"), ("odt", "ODT"),
+                            ];
+                            let archive_types = vec![
+                                ("zip", "ZIP"), ("rar", "RAR"), ("7z", "7Z"), ("tar", "TAR"), ("gz", "GZ"),
+                            ];
+                            let audio_types = vec![
+                                ("mp3", "MP3"), ("wav", "WAV"), ("flac", "FLAC"), ("aac", "AAC"),
+                                ("ogg", "OGG"), ("wma", "WMA"),
+                            ];
+                            let executable_types = vec![
+                                ("exe", "EXE"), ("dll", "DLL"), ("msi", "MSI"),
+                            ];
+                            
+                            // Función para mostrar checkboxes de una categoría
+                            let mut show_category = |ui: &mut egui::Ui, label: &str, emoji: &str, types: &[( &str, &str)]| {
+                                ui.label(egui::RichText::new(format!("{} {}", emoji, label)).size(11.0).strong().color(ACCENT_COLOR));
+                                ui.add_space(3.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for (ext, label) in types {
+                                        let selected = self.selected_individual_types.contains(*ext);
+                                        let checkbox_text = if selected { "✅" } else { "☐" };
+                                        if ui.button(format!("{} {}", checkbox_text, label)).clicked() {
+                                            if selected {
+                                                self.selected_individual_types.remove(*ext);
+                                            } else {
+                                                self.selected_individual_types.insert(ext.to_string());
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.add_space(5.0);
+                            };
+                            
+                            show_category(ui, "Imágenes", "🖼️", &image_types);
+                            show_category(ui, "Videos", "🎬", &video_types);
+                            show_category(ui, "Documentos", "📄", &doc_types);
+                            show_category(ui, "Archivos", "📦", &archive_types);
+                            show_category(ui, "Audio", "🎵", &audio_types);
+                            show_category(ui, "Ejecutables", "⚙️", &executable_types);
+                            
+                            // Botones para seleccionar/deseleccionar todo
+                            ui.horizontal(|ui| {
+                                if ui.button(egui::RichText::new("✅ Todos").size(10.0)).clicked() {
+                                    for (ext, _) in image_types.iter().chain(video_types.iter()).chain(doc_types.iter()).chain(archive_types.iter()).chain(audio_types.iter()).chain(executable_types.iter()) {
+                                        self.selected_individual_types.insert(ext.to_string());
+                                    }
+                                }
+                                if ui.button(egui::RichText::new("☐ Ninguno").size(10.0)).clicked() {
+                                    self.selected_individual_types.clear();
+                                }
+                                // Botón para aplicar el filtro
+                                if ui.button(egui::RichText::new("🔍 Aplicar").size(10.0)).clicked() && !self.selected_individual_types.is_empty() {
+                                    let pattern: Vec<String> = self.selected_individual_types.iter().cloned().collect();
+                                    self.type_filter = Some(pattern.join(","));
+                                }
+                            });
+                        }
+                        
+                        ui.add_space(8.0);
+                        
+                        // Filtro de Calidad
+                        ui.horizontal(|ui| {
+                            let text = if self.quality_filter_enabled { "✅" } else { "☐" };
+                            if ui.button(text).on_hover_text("Activar filtro de calidad").clicked() {
+                                self.quality_filter_enabled = !self.quality_filter_enabled;
+                            }
+                            ui.label("Calidad min:");
+                            ui.add(
+                                egui::Slider::new(&mut self.min_recoverability, 0.0..=100.0)
+                                    .show_value(true)
+                                    .text("%")
+                                    .integer(),
+                            );
+                        });
+                        
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            let dup_text = if self.hide_duplicates { "🔄✅" } else { "🔄☐" };
+                            if ui.button(dup_text).on_hover_text("Ocultar duplicados").clicked() {
+                                self.hide_duplicates = !self.hide_duplicates;
+                            }
+                            ui.label(if self.hide_duplicates {
+                                "Duplicados ocultos"
+                            } else {
+                                "Mostrar duplicados"
+                            });
+                        });
+                        
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label("Buscar:");
                             ui.add_space(3.0);
@@ -1480,19 +1731,19 @@ impl App for RecoverPillApp {
                                     );
                                 });
                                 ui.add_space(6.0);
-                                let ent_color = if file.entropy < 2.0 {
-                                    ERROR_COLOR
-                                } else if file.entropy > 7.5 {
-                                    WARNING_COLOR
-                                } else {
-                                    SUCCESS_COLOR
-                                };
+                                let ent_desc = entropy_description(file.entropy);
+                                let ent_emoji = entropy_emoji(file.entropy);
+                                let ent_col = egui::Color32::from_rgb(
+                                    (entropy_color(file.entropy)[0] * 255.0) as u8,
+                                    (entropy_color(file.entropy)[1] * 255.0) as u8,
+                                    (entropy_color(file.entropy)[2] * 255.0) as u8,
+                                );
                                 ui.horizontal(|ui| {
-                                    ui.label("Entropía:");
+                                    ui.label(format!("Complejidad {}:", ent_emoji));
                                     ui.add_space(5.0);
                                     ui.label(
-                                        egui::RichText::new(format!("{:.2}", file.entropy))
-                                            .color(ent_color)
+                                        egui::RichText::new(format!("{} ({:.1})", ent_desc, file.entropy))
+                                            .color(ent_col)
                                             .strong(),
                                     );
                                 });
@@ -1556,7 +1807,7 @@ impl App for RecoverPillApp {
                             ui.add_space(3.0);
                             ui.label("• >70% = buena calidad");
                             ui.add_space(3.0);
-                            ui.label("• Entropía 3-7.5 = intacto");
+                            ui.label("• 📊 Simple/Complejo = datos intactos");
                         });
                 }
             });
@@ -1598,7 +1849,7 @@ impl App for RecoverPillApp {
                                 SortOption::Type => "Tipo",
                                 SortOption::Size => "Tamaño",
                                 SortOption::Recoverability => "Recup.",
-                                SortOption::Entropy => "Entropía",
+                                SortOption::Entropy => "📊 Complejidad",
                             };
                             egui::ComboBox::from_id_source("sort")
                                 .selected_text(sort_label)
@@ -1627,7 +1878,7 @@ impl App for RecoverPillApp {
                                     ui.selectable_value(
                                         &mut self.sort_by,
                                         SortOption::Entropy,
-                                        "Entropía",
+                                        "📊 Complejidad",
                                     );
                                 });
                             ui.add_space(3.0);
@@ -1677,10 +1928,19 @@ impl App for RecoverPillApp {
                                 self.recover_selected_files();
                             }
                             ui.add_space(8.0);
-                            if ui.button("⭐ >70%").clicked() {
+                            if ui.button(format!("⭐ >= {:.0}%", self.min_recoverability)).clicked() {
+                                let mut count = 0;
                                 for f in &mut self.found_files {
-                                    f.selected = f.recoverability >= 70.0;
+                                    f.selected = false;
+                                    if f.recoverability >= self.min_recoverability {
+                                        f.selected = true;
+                                        count += 1;
+                                    }
                                 }
+                                self.add_console_message(
+                                    format!("✅ {} archivos con calidad >= {:.0}%", count, self.min_recoverability),
+                                    ConsoleLevel::Success,
+                                );
                             }
                             ui.add_space(8.0);
                             if ui.button("☑ Todo").clicked() {
@@ -1730,12 +1990,13 @@ impl App for RecoverPillApp {
             let col_widths = [
                 base_width * 0.03, // ☑ checkbox
                 base_width * 0.03, // 📁 icon
-                base_width * 0.28, // Nombre
+                base_width * 0.25, // Nombre
                 base_width * 0.07, // Tipo
-                base_width * 0.10, // Tamaño
-                base_width * 0.14, // Offset
-                base_width * 0.12, // Recup.
-                base_width * 0.10, // Entropía
+                base_width * 0.09, // Tamaño
+                base_width * 0.12, // Offset
+                base_width * 0.10, // Recup.
+                base_width * 0.09, // Entropía
+                base_width * 0.09, // Estado
             ];
 
             egui::Frame::none()
@@ -1774,7 +2035,11 @@ impl App for RecoverPillApp {
                         );
                         ui.add_sized(
                             [col_widths[7], 18.0],
-                            egui::Label::new(egui::RichText::new("Entropía").size(13.0).strong()),
+                            egui::Label::new(egui::RichText::new("📊 Complejidad").size(13.0).strong()),
+                        );
+                        ui.add_sized(
+                            [col_widths[8], 18.0],
+                            egui::Label::new(egui::RichText::new("Estado").size(13.0).strong()),
                         );
                     });
                 });
@@ -1806,7 +2071,20 @@ impl App for RecoverPillApp {
                             } else {
                                 true
                             };
-                            text_match && type_match
+                            
+                            let quality_match = if self.quality_filter_enabled {
+                                f.recoverability >= self.min_recoverability
+                            } else {
+                                true
+                            };
+                            
+                            let not_duplicate = if self.hide_duplicates {
+                                !f.is_duplicate
+                            } else {
+                                true
+                            };
+
+                            text_match && type_match && quality_match && not_duplicate
                         })
                         .collect();
 
@@ -1894,13 +2172,13 @@ impl App for RecoverPillApp {
                                     ERROR_COLOR
                                 };
 
-                                let ent_col = if file.entropy < 2.0 {
-                                    ERROR_COLOR
-                                } else if file.entropy > 7.5 {
-                                    WARNING_COLOR
-                                } else {
-                                    SUCCESS_COLOR
-                                };
+                                let ent_desc = entropy_description(file.entropy);
+                                let ent_emoji = entropy_emoji(file.entropy);
+                                let ent_col = egui::Color32::from_rgb(
+                                    (entropy_color(file.entropy)[0] * 255.0) as u8,
+                                    (entropy_color(file.entropy)[1] * 255.0) as u8,
+                                    (entropy_color(file.entropy)[2] * 255.0) as u8,
+                                );
 
                                 ui.horizontal(|ui| {
                                     let mut check_state = file.selected;
@@ -1984,9 +2262,34 @@ impl App for RecoverPillApp {
                                     ui.add_sized(
                                         [col_widths[7], 18.0],
                                         egui::Label::new(
-                                            egui::RichText::new(format!("{:.1}", file.entropy))
+                                            egui::RichText::new(format!("{} {}", ent_emoji, ent_desc))
                                                 .color(ent_col)
-                                                .size(9.0),
+                                                .size(8.0),
+                                        ),
+                                    );
+                                    
+                                    // Columna de estado: validación y duplicados
+                                    let status_text = if file.is_duplicate {
+                                        "🔄 Dup"
+                                    } else if file.is_validated {
+                                        "✓ OK"
+                                    } else {
+                                        "⏳ Pend."
+                                    };
+                                    let status_col = if file.is_duplicate {
+                                        WARNING_COLOR
+                                    } else if file.is_validated {
+                                        SUCCESS_COLOR
+                                    } else {
+                                        egui::Color32::from_gray(150)
+                                    };
+                                    ui.add_sized(
+                                        [col_widths[8], 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(status_text)
+                                                .color(status_col)
+                                                .size(8.0)
+                                                .strong(),
                                         ),
                                     );
                                 });

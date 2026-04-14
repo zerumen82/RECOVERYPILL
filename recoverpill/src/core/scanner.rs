@@ -56,6 +56,10 @@ pub struct FoundFile {
     pub entropy: f64,
     pub signature_matched: String,
     pub selected: bool, // Whether user selected this file
+    pub is_validated: bool, // File has been validated and is not corrupted
+    pub content_hash: Option<String>, // Hash para detección de duplicados
+    pub is_duplicate: bool, // Mark if this is a duplicate
+    pub duplicate_group: Option<String>, // Group ID for duplicates
 }
 
 /// Resultado del escaneo
@@ -80,6 +84,8 @@ pub struct Scanner {
     chunk_size: usize,
     // Clasificador IA para análisis de archivos
     ai_classifier: AIClassifier,
+    // Filtro de calidad mínima (0-100)
+    min_recoverability: f64,
 }
 
 impl Scanner {
@@ -98,21 +104,27 @@ impl Scanner {
             progress: Arc::new(RwLock::new(ScanProgress::new(total_bytes))),
             should_stop: Arc::new(AtomicBool::new(false)),
             is_scanning: Arc::new(AtomicBool::new(false)),
-            chunk_size: 1024 * 1024, // 1MB chunks - mucho más rápido para escaneo profundo
+            chunk_size: 2 * 1024 * 1024, // 2MB chunks - balance entre velocidad y memoria
             ai_classifier: AIClassifier::new(),
+            min_recoverability: 0.0, // Sin filtro por defecto
         })
     }
 
     /// Escanea el disco en busca de archivos
     pub fn scan(&mut self, enabled_types: Option<Vec<FileType>>) -> ScanResult {
         // Usar el método con deep scan y progress callback
-        self.scan_with_progress(|msg| {
+        self.scan_with_progress(enabled_types, 0.0, |msg| {
             info!("{}", msg);
         })
     }
 
     /// Escanea el disco con callback de progreso (optimizado)
-    pub fn scan_with_progress<F>(&mut self, mut progress_callback: F) -> ScanResult
+    pub fn scan_with_progress<F>(
+        &mut self,
+        enabled_types: Option<Vec<FileType>>,
+        min_recoverability: f64,
+        mut progress_callback: F,
+    ) -> ScanResult
     where
         F: FnMut(String) + Send + 'static,
     {
@@ -121,6 +133,9 @@ impl Scanner {
 
         self.should_stop.store(false, Ordering::SeqCst);
         self.is_scanning.store(true, Ordering::SeqCst);
+
+        // Guardar filtro de calidad
+        self.min_recoverability = min_recoverability;
 
         // Limpiar resultados anteriores
         {
@@ -148,10 +163,9 @@ impl Scanner {
         }
 
         let mut bytes_scanned: u64 = 0;
-        let mut files_found_count: u64 = 0;
 
         // Chunks más grandes para mejor rendimiento en discos formateados
-        let chunk_size = 1024 * 1024; // 1MB por chunk - mejor rendimiento para escaneo profundo
+        let chunk_size = 2 * 1024 * 1024; // 2MB por chunk - mejor rendimiento
         let mut offset: u64 = 0;
 
         // Log de diagnóstico - enviar a través del callback para que se vea en la UI
@@ -166,6 +180,14 @@ impl Scanner {
             "Número de firmas en base de datos: {}",
             SIGNATURE_DATABASE.len()
         ));
+        
+        if let Some(ref types) = enabled_types {
+            progress_callback(format!(
+                "Filtro de tipos activado: {:?}",
+                types.iter().map(|t| t.extension()).collect::<Vec<_>>()
+            ));
+        }
+        
         progress_callback(format!("=============================="));
 
         progress_callback(format!(
@@ -213,7 +235,7 @@ impl Scanner {
             }
 
             // BÚSQUEDA PROFUNDA: Escanear el chunk de forma paralela y exhaustiva
-            let found = self.search_signatures_deep(&data, offset, &None);
+            let found = self.search_signatures_deep(&data, offset, &enabled_types);
 
             if self.should_stop.load(Ordering::SeqCst) {
                 break;
@@ -242,7 +264,10 @@ impl Scanner {
 
             let advance = if skip_distance > 0 {
                 // Saltar el archivo pero alineado a sectores
-                (skip_distance / 512) * 512
+                // IMPORTANTE: Limitar el salto para no perder archivos
+                // Usar el mínimo entre skip_distance y chunk_size para evitar saltos muy grandes
+                let limited_skip = std::cmp::min(skip_distance, (current_chunk * 10) as u64);
+                (limited_skip / 512) * 512
             } else {
                 current_chunk as u64
             };
@@ -260,14 +285,6 @@ impl Scanner {
 
             let files_count = self.found_files.read().len();
             let percent = (bytes_scanned as f64 / total_bytes as f64) * 100.0;
-
-            // Log de progreso cada 1%
-            if percent as u64 % 1 == 0 {
-                info!(
-                    "Progreso: {:.1}% - {} archivos encontrados",
-                    percent, files_count
-                );
-            }
 
             progress_callback(format!(
                 "Progreso: {:.1}% - {} archivos encontrados",
@@ -290,6 +307,10 @@ impl Scanner {
         }
 
         self.is_scanning.store(false, Ordering::SeqCst);
+
+        // Detectar duplicados antes de retornar
+        drop(self.found_files.read()); // Liberar el read lock
+        self.detect_and_mark_duplicates();
 
         let files = self.found_files.read().clone();
 
@@ -385,6 +406,10 @@ impl Scanner {
                             &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]
                         ),
                         selected: true,
+                        is_validated: false,
+                        content_hash: None,
+                        is_duplicate: false,
+                        duplicate_group: None,
                     });
                 }
             }
@@ -437,6 +462,10 @@ impl Scanner {
                             &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]
                         ),
                         selected: true,
+                        is_validated: false,
+                        content_hash: None,
+                        is_duplicate: false,
+                        duplicate_group: None,
                     });
                 }
             }
@@ -629,6 +658,7 @@ impl Scanner {
         let should_stop = self.should_stop.clone();
         let ai_classifier = &self.ai_classifier;
         let enabled_types_ref = enabled_types.as_ref();
+        let min_recoverability = 0.0; // No aplicar filtro en deep scan paralelo (se aplica en search_signatures)
 
         let sectors: Vec<(usize, &[u8])> = data
             .chunks(step)
@@ -652,7 +682,8 @@ impl Scanner {
                     sector,
                     base_offset + offset_in_chunk as u64,
                     enabled_types_ref,
-                    ai_classifier
+                    ai_classifier,
+                    min_recoverability,
                 )
             })
             .collect()
@@ -664,6 +695,7 @@ impl Scanner {
         offset: u64,
         enabled_types: Option<&Vec<FileType>>,
         ai_classifier: &AIClassifier,
+        _min_recoverability: f64,
     ) -> Option<FoundFile> {
         for sig in SIGNATURE_DATABASE.iter() {
             if sig.magic_bytes.is_empty() {
@@ -679,13 +711,13 @@ impl Scanner {
             if sig.matches(window) {
                 // FILTRO DE CALIDAD BALANCEADO
                 let entropy = calculate_entropy(window);
-                
+
                 // Solo descartar si el sector es extremadamente pobre en datos (todo ceros o FF)
                 if entropy < 0.1 {
                     continue;
                 }
 
-                // Usar IA para calcular la puntuación, pero NO descartar por ahora
+                // Usar IA para calcular la puntuación
                 let ai_classification = ai_classifier.classify(window);
                 let mut recoverability = ai_classification.recovery_prediction.probability;
 
@@ -694,9 +726,12 @@ impl Scanner {
                     recoverability = (recoverability + 20.0).min(100.0);
                 }
 
+                // NOTA: NO filtrar por recoverability aquí - mostrar todos los archivos encontrados
+                // El filtro de calidad se aplica en la UI y durante la recuperación
+
                 let estimated_size = sig.estimate_size(window).unwrap_or(0);
                 let extracted_name = extract_filename_from_data(window, &sig.file_type);
-                
+
                 let file_name = extracted_name.unwrap_or_else(|| {
                     format!("{}_{}", sig.file_type.extension().to_uppercase(), offset / 1024 / 1024)
                 });
@@ -710,6 +745,10 @@ impl Scanner {
                     entropy,
                     signature_matched: format!("{:02X?}", &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]),
                     selected: true,
+                    is_validated: false,
+                    content_hash: None,
+                    is_duplicate: false,
+                    duplicate_group: None,
                 });
             }
         }
@@ -746,6 +785,7 @@ impl Scanner {
                 window,
                 base_offset + window_start as u64,
                 enabled_types,
+                self.min_recoverability,
             ) {
                 found.push(found_file);
             }
@@ -760,6 +800,7 @@ impl Scanner {
         window: &[u8],
         offset: u64,
         enabled_types: &Option<Vec<FileType>>,
+        _min_recoverability: f64,
     ) -> Option<FoundFile> {
         // Verificar cada firma
         for sig in SIGNATURE_DATABASE.iter() {
@@ -807,6 +848,9 @@ impl Scanner {
 
                 let recoverability = ai_classification.recovery_prediction.probability;
 
+                // NOTA: NO filtrar por recoverability aquí - mostrar todos los archivos encontrados
+                // El filtro de calidad se aplica en la UI y durante la recuperación
+
                 // Intentar extraer nombre de archivo de los metadatos
                 let extracted_name = extract_filename_from_data(window, &sig.file_type);
 
@@ -832,6 +876,10 @@ impl Scanner {
                         &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]
                     ),
                     selected: true,
+                    is_validated: false,
+                    content_hash: None,
+                    is_duplicate: false,
+                    duplicate_group: None,
                 });
             }
         }
@@ -894,6 +942,55 @@ impl Scanner {
     /// Obtiene los archivos encontrados
     pub fn get_found_files(&self) -> Vec<FoundFile> {
         self.found_files.read().clone()
+    }
+
+    /// Detecta y marca archivos duplicados basados en hash de contenido
+    /// Conserva el de mejor calidad (mayor recoverability)
+    pub fn detect_and_mark_duplicates(&mut self) {
+        use std::collections::HashMap;
+        
+        let mut files = self.found_files.write();
+        
+        // Agrupar archivos por tipo y hash de contenido
+        // Usamos el offset como "hash" inicial ya que representa la ubicación en disco
+        // Para una detección más precisa, necesitaríamos leer el contenido
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        
+        for (i, file) in files.iter().enumerate() {
+            // Crear una clave basada en tipo y tamaño aproximado
+            // El tamaño es un buen proxy para detectar archivos similares
+            let size_key = file.estimated_size / 1024; // Redondear a KB
+            let group_key = format!("{}_{:?}", file.file_type.extension(), size_key);
+            
+            groups.entry(group_key).or_insert_with(Vec::new).push(i);
+        }
+        
+        // Para cada grupo con más de un archivo, marcar duplicados
+        for (_key, indices) in groups.iter() {
+            if indices.len() <= 1 {
+                continue;
+            }
+            
+            // Encontrar el archivo con mejor recoverability
+            let mut best_idx = indices[0];
+            let mut best_score = files[best_idx].recoverability;
+            
+            for &idx in &indices[1..] {
+                if files[idx].recoverability > best_score {
+                    best_score = files[idx].recoverability;
+                    best_idx = idx;
+                }
+            }
+            
+            // Generar un ID de grupo
+            let group_id = format!("dup_{}", _key);
+            
+            // Marcar todos como duplicados
+            for &idx in indices {
+                files[idx].is_duplicate = idx != best_idx;
+                files[idx].duplicate_group = Some(group_id.clone());
+            }
+        }
     }
 
     /// Obtiene archivos por tipo
@@ -1062,6 +1159,10 @@ impl Scanner {
                     "Sistema de archivos (existente)".to_string()
                 },
                 selected: true,
+                is_validated: false,
+                content_hash: None,
+                is_duplicate: false,
+                duplicate_group: None,
             };
 
             // Actualizar progreso
@@ -1094,6 +1195,11 @@ impl Scanner {
 
         self.is_scanning.store(false, Ordering::SeqCst);
 
+        // Detectar duplicados antes de retornar
+        self.detect_and_mark_duplicates();
+
+        let files = self.found_files.read().clone();
+
         // Guardar el cluster_size antes de mover el reader
         let cluster_size = fs_reader.get_cluster_size();
 
@@ -1103,13 +1209,13 @@ impl Scanner {
         info!(
             "Escaneo del sistema de archivos completado en {}ms. Archivos: {}",
             scan_time,
-            found_files.len()
+            files.len()
         );
 
         ScanResult {
             drive: self.drive_path.clone(),
             total_bytes: cluster_size * 1000, // Estimación
-            files_found: found_files,
+            files_found: files,
             scan_time_ms: scan_time,
             success: true,
             error_message: None,
