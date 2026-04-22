@@ -50,7 +50,6 @@ pub struct RecoverPillApp {
     all_filters_enabled: bool,
     type_filter: Option<String>,
     selected_individual_types: std::collections::HashSet<String>,
-    show_individual_types: bool,
     console_messages: Vec<ConsoleMessage>,
     selected_file: Option<usize>,
     preview_data: Option<Vec<u8>>,
@@ -142,7 +141,6 @@ impl RecoverPillApp {
             all_filters_enabled: true,
             type_filter: None,
             selected_individual_types: std::collections::HashSet::new(),
-            show_individual_types: false,
             console_messages: vec![ConsoleMessage {
                 text: format!("recoverPill v1.0.0 listo (Compilado: {})", BUILD_DATE),
                 level: ConsoleLevel::Info,
@@ -1211,7 +1209,7 @@ impl App for RecoverPillApp {
                             egui::RichText::new(match self.scan_mode {
                                 ScanMode::Signature => {
                                     "Recupera archivos borrados de discos formateados"
-                                }
+                                },
                                 ScanMode::FileSystem => "Lista archivos existentes en el sistema",
                             })
                             .size(10.0)
@@ -1322,8 +1320,7 @@ impl App for RecoverPillApp {
                                 ("ZIP", "zip,rar,7z,tar,gz", "Comprimidos"),
                             ];
                             for (label, pattern, tooltip) in types {
-                                let is_active = self.type_filter.as_deref() == Some(pattern)
-                                    || (pattern.is_empty() && self.type_filter.is_none() && !self.show_individual_types);
+                                let is_active = self.type_filter.as_deref() == Some(pattern);
                                 let btn = egui::Button::new(
                                     egui::RichText::new(label).size(11.0).color(if is_active {
                                         egui::Color32::WHITE
@@ -1338,35 +1335,23 @@ impl App for RecoverPillApp {
                                 })
                                 .min_size(egui::vec2(35.0, 22.0));
                                 if ui.add(btn).on_hover_text(tooltip).clicked() {
-                                    self.show_individual_types = false;
                                     if pattern.is_empty() {
                                         self.type_filter = None;
+                                        self.selected_individual_types.clear();
                                     } else {
                                         self.type_filter = Some(pattern.to_string());
+                                        self.selected_individual_types.clear();
+                                        let exts: Vec<&str> = pattern.split(',').collect();
+                                        for ext in exts {
+                                            self.selected_individual_types.insert(ext.trim().to_string());
+                                        }
                                     }
                                 }
-                            }
-                            // Botón para activar selección individual
-                            let custom_btn = egui::Button::new(
-                                egui::RichText::new("⚙️").size(11.0).color(if self.show_individual_types {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::from_gray(180)
-                                }),
-                            )
-                            .fill(if self.show_individual_types {
-                                ACCENT_COLOR
-                            } else {
-                                egui::Color32::from_gray(50)
-                            })
-                            .min_size(egui::vec2(35.0, 22.0));
-                            if ui.add(custom_btn).on_hover_text("Seleccionar tipos individuales").clicked() {
-                                self.show_individual_types = !self.show_individual_types;
                             }
                         });
                         
                         // Selección individual de tipos de archivo
-                        if self.show_individual_types {
+                        {
                             ui.add_space(8.0);
                             ui.separator();
                             ui.add_space(5.0);
@@ -1435,7 +1420,6 @@ impl App for RecoverPillApp {
                                 if ui.button(egui::RichText::new("☐ Ninguno").size(10.0)).clicked() {
                                     self.selected_individual_types.clear();
                                 }
-                                // Botón para aplicar el filtro
                                 if ui.button(egui::RichText::new("🔍 Aplicar").size(10.0)).clicked() && !self.selected_individual_types.is_empty() {
                                     let pattern: Vec<String> = self.selected_individual_types.iter().cloned().collect();
                                     self.type_filter = Some(pattern.join(","));
@@ -2377,3 +2361,11 @@ impl Default for RecoverPillApp {
         Self::new()
     }
 }
+
+
+
+
+
+
+
+
