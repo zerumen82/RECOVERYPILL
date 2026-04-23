@@ -55,10 +55,10 @@ pub struct FoundFile {
     pub recoverability: f64, // 0-100%
     pub entropy: f64,
     pub signature_matched: String,
-    pub selected: bool, // Whether user selected this file
-    pub is_validated: bool, // File has been validated and is not corrupted
-    pub content_hash: Option<String>, // Hash para detección de duplicados
-    pub is_duplicate: bool, // Mark if this is a duplicate
+    pub selected: bool,                  // Whether user selected this file
+    pub is_validated: bool,              // File has been validated and is not corrupted
+    pub content_hash: Option<String>,    // Hash para detección de duplicados
+    pub is_duplicate: bool,              // Mark if this is a duplicate
     pub duplicate_group: Option<String>, // Group ID for duplicates
 }
 
@@ -180,14 +180,14 @@ impl Scanner {
             "Número de firmas en base de datos: {}",
             SIGNATURE_DATABASE.len()
         ));
-        
+
         if let Some(ref types) = enabled_types {
             progress_callback(format!(
                 "Filtro de tipos activado: {:?}",
                 types.iter().map(|t| t.extension()).collect::<Vec<_>>()
             ));
         }
-        
+
         progress_callback(format!("=============================="));
 
         progress_callback(format!(
@@ -248,7 +248,7 @@ impl Scanner {
                 for f in &found {
                     if !files.iter().any(|existing| existing.offset == f.offset) {
                         files.push(f.clone());
-                        
+
                         // SMART SKIPPING: Si el archivo es grande y confiable, saltamos su contenido
                         if f.estimated_size > current_chunk as u64 && f.recoverability > 60.0 {
                             // Guardamos la distancia máxima a saltar basándonos en el archivo más grande encontrado en este bloque
@@ -344,8 +344,8 @@ impl Scanner {
         let mut found = Vec::new();
 
         // OPTIMIZADO: Ventana más pequeña y step más grande para rendimiento
-        let window_size = 512;  // Solo buscamos el header/magic bytes
-        let step = 512;         // Paso más grande para mejor rendimiento
+        let window_size = 512; // Solo buscamos el header/magic bytes
+        let step = 512; // Paso más grande para mejor rendimiento
 
         for window_start in (0..data.len().saturating_sub(window_size)).step_by(step) {
             if self.should_stop.load(Ordering::SeqCst) {
@@ -355,7 +355,9 @@ impl Scanner {
             let window = &data[window_start..std::cmp::min(window_start + window_size, data.len())];
 
             // Solo buscar firmas en esta ventana (más rápido que carve_file_from_window)
-            if let Some(file_info) = self.quick_carve_window(window, base_offset + window_start as u64) {
+            if let Some(file_info) =
+                self.quick_carve_window(window, base_offset + window_start as u64)
+            {
                 found.push(file_info);
             }
         }
@@ -653,7 +655,7 @@ impl Scanner {
         enabled_types: &Option<Vec<FileType>>,
     ) -> Vec<FoundFile> {
         let step = 512; // Alinear con sectores de disco
-        
+
         // Capturar solo lo necesario para el closure para evitar problemas de Sync con DiskReader
         let should_stop = self.should_stop.clone();
         let ai_classifier = &self.ai_classifier;
@@ -666,7 +668,8 @@ impl Scanner {
             .map(|(i, chunk)| (i * step, chunk))
             .collect();
 
-        sectors.into_par_iter()
+        sectors
+            .into_par_iter()
             .filter_map(|(offset_in_chunk, sector)| {
                 if should_stop.load(Ordering::SeqCst) {
                     return None;
@@ -733,7 +736,11 @@ impl Scanner {
                 let extracted_name = extract_filename_from_data(window, &sig.file_type);
 
                 let file_name = extracted_name.unwrap_or_else(|| {
-                    format!("{}_{}", sig.file_type.extension().to_uppercase(), offset / 1024 / 1024)
+                    format!(
+                        "{}_{}",
+                        sig.file_type.extension().to_uppercase(),
+                        offset / 1024 / 1024
+                    )
                 });
 
                 return Some(FoundFile {
@@ -743,7 +750,10 @@ impl Scanner {
                     estimated_size,
                     recoverability,
                     entropy,
-                    signature_matched: format!("{:02X?}", &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]),
+                    signature_matched: format!(
+                        "{:02X?}",
+                        &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]
+                    ),
                     selected: true,
                     is_validated: false,
                     content_hash: None,
@@ -948,47 +958,43 @@ impl Scanner {
     /// Conserva el de mejor calidad (mayor recoverability)
     pub fn detect_and_mark_duplicates(&mut self) {
         use std::collections::HashMap;
-        
+
         let mut files = self.found_files.write();
-        
-        // Agrupar archivos por tipo y hash de contenido
-        // Usamos el offset como "hash" inicial ya que representa la ubicación en disco
-        // Para una detección más precisa, necesitaríamos leer el contenido
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-        
+
+        // Detección de duplicados 100% fiable SIN falsos positivos:
+        let mut groups: HashMap<(u64, u64, FileType), Vec<usize>> = HashMap::new();
+
         for (i, file) in files.iter().enumerate() {
-            // Crear una clave basada en tipo y tamaño aproximado
-            // El tamaño es un buen proxy para detectar archivos similares
-            let size_key = file.estimated_size / 1024; // Redondear a KB
-            let group_key = format!("{}_{:?}", file.file_type.extension(), size_key);
-            
-            groups.entry(group_key).or_insert_with(Vec::new).push(i);
+            // SOLAMENTE consideramos duplicados archivos en EXACTAMENTE el mismo offset
+            let key = (file.offset, file.estimated_size, file.file_type);
+            groups.entry(key).or_insert_with(Vec::new).push(i);
         }
-        
-        // Para cada grupo con más de un archivo, marcar duplicados
+
+        // Para cada grupo con MAS DE UN archivo en la MISMA posición física
         for (_key, indices) in groups.iter() {
             if indices.len() <= 1 {
                 continue;
             }
-            
-            // Encontrar el archivo con mejor recoverability
+
+            // Conservar el archivo con mejor puntuación de calidad
             let mut best_idx = indices[0];
             let mut best_score = files[best_idx].recoverability;
-            
+
             for &idx in &indices[1..] {
                 if files[idx].recoverability > best_score {
                     best_score = files[idx].recoverability;
                     best_idx = idx;
                 }
             }
-            
-            // Generar un ID de grupo
-            let group_id = format!("dup_{}", _key);
-            
-            // Marcar todos como duplicados
+
+            // Marcar como duplicados solo las copias extra
             for &idx in indices {
                 files[idx].is_duplicate = idx != best_idx;
-                files[idx].duplicate_group = Some(group_id.clone());
+                files[idx].duplicate_group = if idx != best_idx {
+                    Some(format!("dup_{:x}_{:x}", _key.0, _key.1))
+                } else {
+                    None
+                };
             }
         }
     }
@@ -1394,7 +1400,8 @@ fn extract_pdf_metadata_filename(data: &[u8]) -> Option<String> {
             let start = start_paren + 1;
             if let Some(end_paren) = after_title[start..].find(')') {
                 let title = &after_title[start..start + end_paren];
-                let clean_title: String = title.chars()
+                let clean_title: String = title
+                    .chars()
                     .filter(|c| c.is_alphanumeric() || *c == '_' || *c == ' ' || *c == '-')
                     .collect();
                 if !clean_title.trim().is_empty() {
@@ -1408,17 +1415,27 @@ fn extract_pdf_metadata_filename(data: &[u8]) -> Option<String> {
 
 /// Extrae nombre de archivo de metadatos JPEG (Mejorado con EXIF Real)
 fn extract_jpeg_metadata_filename(data: &[u8]) -> Option<String> {
-    if data.len() < 256 { return None; }
+    if data.len() < 256 {
+        return None;
+    }
 
     // Buscar marcador de fecha EXIF (0x9003 - DateTimeOriginal o 0x0132 - DateTime)
     // Patrón típico: YYYY:MM:DD HH:MM:SS
     for i in 0..std::cmp::min(data.len() - 20, 4096) {
-        if data[i] >= b'1' && data[i] <= b'2' && data[i+4] == b':' && data[i+7] == b':' && data[i+10] == b' ' {
-             let date_str = String::from_utf8_lossy(&data[i..i+19]);
-             if date_str.chars().all(|c| c.is_numeric() || c == ':' || c == ' ') {
-                 let clean_date = date_str.replace(':', "").replace(' ', "_");
-                 return Some(format!("IMG_{}.jpg", clean_date));
-             }
+        if data[i] >= b'1'
+            && data[i] <= b'2'
+            && data[i + 4] == b':'
+            && data[i + 7] == b':'
+            && data[i + 10] == b' '
+        {
+            let date_str = String::from_utf8_lossy(&data[i..i + 19]);
+            if date_str
+                .chars()
+                .all(|c| c.is_numeric() || c == ':' || c == ' ')
+            {
+                let clean_date = date_str.replace(':', "").replace(' ', "_");
+                return Some(format!("IMG_{}.jpg", clean_date));
+            }
         }
     }
     None
