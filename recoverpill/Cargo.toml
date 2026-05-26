@@ -22,7 +22,9 @@ winapi = { version = "0.3", features = [
     "ioapiset", 
     "errhandlingapi",
     "windef",
-    "winnt"
+    "winnt",
+    "setupapi",
+    "cfgmgr32"
 ]}
 
 # Procesamiento de imágenes
@@ -45,6 +47,13 @@ parking_lot = "0.12"
 
 # Tiempo
 chrono = "0.4"
+
+# Compresión para análisis de formatos Android
+flate2 = "1.0"
+byteorder = "1.5"
+
+# UUID generation para sesiones
+uuid = { version = "1.0", features = ["v4"] }
 
 [build-dependencies]
 chrono = "0.4"

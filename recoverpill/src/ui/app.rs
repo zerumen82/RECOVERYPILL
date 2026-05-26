@@ -1,24 +1,37 @@
 //! Aplicación principal de recoverPill
 //! Interfaz gráfica con egui para la recuperación de datos.
+//! Con soporte multi-pestaña: Escaneo, Android, Configuración.
 
 use eframe::{egui, App};
-use log::info;
+use log::{info, error};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use crate::ai::entropy::{entropy_description, entropy_emoji, entropy_color};
 use crate::build_info::BUILD_DATE;
 use crate::core::scanner::{FoundFile, ScanProgress, Scanner};
 use crate::core::signatures::get_categories;
 use crate::disk::drive_info::{get_available_drives, DriveInfo};
+use crate::disk::android::{AndroidDevice, AndroidRecoveryEngine, AndroidScanResult};
 
 const APP_TITLE: &str = "recoverPill - Recuperación de Datos";
 const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(30, 32, 40);
 const CARD_BG: egui::Color32 = egui::Color32::from_rgb(40, 44, 55);
+const CARD_HOVER: egui::Color32 = egui::Color32::from_rgb(50, 55, 70);
 const ACCENT_COLOR: egui::Color32 = egui::Color32::from_rgb(66, 135, 245);
+const ACCENT_LIGHT: egui::Color32 = egui::Color32::from_rgb(100, 170, 255);
 const SUCCESS_COLOR: egui::Color32 = egui::Color32::from_rgb(76, 175, 80);
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 193, 7);
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(244, 67, 54);
+const ANDROID_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 185, 96); // Green Android
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Scan,
+    Android,
+    Settings,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanMode {
@@ -27,6 +40,10 @@ enum ScanMode {
 }
 
 pub struct RecoverPillApp {
+    // Navegación
+    current_tab: MainTab,
+
+    // Escaneo
     drives: Vec<DriveInfo>,
     selected_drive: Option<usize>,
     scanner: Option<Scanner>,
@@ -71,6 +88,38 @@ pub struct RecoverPillApp {
     items_per_page: usize,
     scan_mode: ScanMode,
     disk_map: Vec<u8>, // 0: unread, 1: scanning, 2: scanned, 3: found, 4: error
+
+    // Configuración avanzada
+    multi_pass_enabled: bool,
+    multi_pass_count: u32,
+    footer_detection_enabled: bool,
+
+    // Android
+    android_engine: Option<AndroidRecoveryEngine>,
+    android_devices: Vec<AndroidDevice>,
+    android_selected_device: Option<usize>,
+    android_is_scanning: bool,
+    android_scan_result: Option<AndroidScanResult>,
+    android_scan_progress: String,
+    android_output_folder: String,
+    android_backup_in_progress: bool,
+    adb_available: bool,
+
+    // Sesión
+    current_session_file: Option<PathBuf>,
+    status_message: String,
+    status_timer: f32,
+
+    // Canales para Android
+    android_scan_receiver: Option<std::sync::mpsc::Receiver<AndroidScanResult>>,
+    android_backup_receiver: Option<std::sync::mpsc::Receiver<Result<Vec<std::path::PathBuf>, String>>>,
+
+    // Timing para ETA
+    recovery_start_time: Option<std::time::Instant>,
+    recovery_eta: String,
+
+    // Confirmación de detención
+    stop_confirm: bool,
 }
 
 struct RecoveryResult {
@@ -119,53 +168,150 @@ impl RecoverPillApp {
         let categories = get_categories();
         let enabled_filters: Vec<String> = categories.iter().map(|s| s.to_string()).collect();
 
-        RecoverPillApp {
-            drives,
-            selected_drive: None,
-            scanner: None,
-            is_scanning: false,
-            is_recovering: false,
-            scan_progress: ScanProgress::new(0),
-            recovery_progress: 0.0,
-            found_files: Vec::new(),
-            scan_percentage: 0.0,
-            last_ten_percent: -1,
-            current_notification: None,
-            notification_timer: 0.0,
-            should_stop: Arc::new(AtomicBool::new(false)),
-            scan_result_receiver: None,
-            progress_receiver: None,
-            recovery_receiver: None,
-            recovery_progress_receiver: None,
-            enabled_filters,
-            all_filters_enabled: true,
-            type_filter: None,
-            selected_individual_types: std::collections::HashSet::new(),
-            console_messages: vec![ConsoleMessage {
-                text: format!("recoverPill v1.0.0 listo (Compilado: {})", BUILD_DATE),
-                level: ConsoleLevel::Info,
-            }],
-            selected_file: None,
-            preview_data: None,
-            preview_file_index: None,
-            preview_width: 0,
-            preview_height: 0,
-            preview_loading: false,
-            preview_error: None,
-            preview_texture: None,
-            preview_receiver: None,
-            last_drive_path: None,
-            filter_text: String::new(),
-            quality_filter_enabled: false,
-            hide_duplicates: true, // Por defecto ocultar duplicados
-            min_recoverability: 70.0,
-            output_folder: String::new(),
-            sort_by: SortOption::Recoverability,
-            sort_ascending: false,
-            current_page: 0,
-            items_per_page: 200,
-            scan_mode: ScanMode::Signature,
-            disk_map: vec![0u8; 1000],
+        let adb_available = AndroidRecoveryEngine::is_available();
+        if adb_available {
+            info!("ADB disponible - módulo Android activo");
+            let mut engine = AndroidRecoveryEngine::new();
+            let devices = engine.detect_devices();
+            RecoverPillApp {
+                drives,
+                current_tab: MainTab::Scan,
+                selected_drive: None,
+                scanner: None,
+                is_scanning: false,
+                is_recovering: false,
+                scan_progress: ScanProgress::new(0),
+                recovery_progress: 0.0,
+                found_files: Vec::new(),
+                scan_percentage: 0.0,
+                last_ten_percent: -1,
+                current_notification: None,
+                notification_timer: 0.0,
+                should_stop: Arc::new(AtomicBool::new(false)),
+                scan_result_receiver: None,
+                progress_receiver: None,
+                recovery_receiver: None,
+                recovery_progress_receiver: None,
+                enabled_filters,
+                all_filters_enabled: true,
+                type_filter: None,
+                selected_individual_types: std::collections::HashSet::new(),
+                console_messages: vec![ConsoleMessage {
+                    text: format!("recoverPill v1.0.0 listo (Compilado: {})", BUILD_DATE),
+                    level: ConsoleLevel::Info,
+                }],
+                selected_file: None,
+                preview_data: None,
+                preview_file_index: None,
+                preview_width: 0,
+                preview_height: 0,
+                preview_loading: false,
+                preview_error: None,
+                preview_texture: None,
+                preview_receiver: None,
+                last_drive_path: None,
+                filter_text: String::new(),
+                quality_filter_enabled: false,
+                hide_duplicates: true,
+                min_recoverability: 70.0,
+                output_folder: String::new(),
+                sort_by: SortOption::Recoverability,
+                sort_ascending: false,
+                current_page: 0,
+                items_per_page: 200,
+                scan_mode: ScanMode::Signature,
+                disk_map: vec![0u8; 1000],
+                multi_pass_enabled: false,
+                multi_pass_count: 2,
+                footer_detection_enabled: true,
+                android_engine: Some(engine),
+                android_devices: devices,
+                android_selected_device: None,
+                android_is_scanning: false,
+                android_scan_result: None,
+                android_scan_progress: String::new(),
+                android_output_folder: String::new(),
+                android_backup_in_progress: false,
+                adb_available,
+                current_session_file: None,
+                status_message: String::new(),
+                status_timer: 0.0,
+                android_scan_receiver: None,
+                android_backup_receiver: None,
+                recovery_start_time: None,
+                recovery_eta: String::new(),
+                stop_confirm: false,
+            }
+        } else {
+            RecoverPillApp {
+                drives,
+                current_tab: MainTab::Scan,
+                selected_drive: None,
+                scanner: None,
+                is_scanning: false,
+                is_recovering: false,
+                scan_progress: ScanProgress::new(0),
+                recovery_progress: 0.0,
+                found_files: Vec::new(),
+                scan_percentage: 0.0,
+                last_ten_percent: -1,
+                current_notification: None,
+                notification_timer: 0.0,
+                should_stop: Arc::new(AtomicBool::new(false)),
+                scan_result_receiver: None,
+                progress_receiver: None,
+                recovery_receiver: None,
+                recovery_progress_receiver: None,
+                enabled_filters,
+                all_filters_enabled: true,
+                type_filter: None,
+                selected_individual_types: std::collections::HashSet::new(),
+                console_messages: vec![ConsoleMessage {
+                    text: format!("recoverPill v1.0.0 listo (Compilado: {})", BUILD_DATE),
+                    level: ConsoleLevel::Info,
+                }],
+                selected_file: None,
+                preview_data: None,
+                preview_file_index: None,
+                preview_width: 0,
+                preview_height: 0,
+                preview_loading: false,
+                preview_error: None,
+                preview_texture: None,
+                preview_receiver: None,
+                last_drive_path: None,
+                filter_text: String::new(),
+                quality_filter_enabled: false,
+                hide_duplicates: true,
+                min_recoverability: 70.0,
+                output_folder: String::new(),
+                sort_by: SortOption::Recoverability,
+                sort_ascending: false,
+                current_page: 0,
+                items_per_page: 200,
+                scan_mode: ScanMode::Signature,
+                disk_map: vec![0u8; 1000],
+                multi_pass_enabled: false,
+                multi_pass_count: 2,
+                footer_detection_enabled: true,
+                android_engine: None,
+                android_devices: Vec::new(),
+                android_selected_device: None,
+                android_is_scanning: false,
+                android_scan_result: None,
+                android_scan_progress: String::new(),
+                android_output_folder: String::new(),
+                android_backup_in_progress: false,
+                adb_available,
+                current_session_file: None,
+                status_message: String::new(),
+                status_timer: 0.0,
+                android_scan_receiver: None,
+                android_backup_receiver: None,
+                recovery_start_time: None,
+                recovery_eta: String::new(),
+                stop_confirm: false,
+            }
         }
     }
 
@@ -319,6 +465,9 @@ impl RecoverPillApp {
 
         let should_stop = self.should_stop.clone();
         let min_recoverability = self.min_recoverability;
+        let multi_pass = self.multi_pass_enabled;
+        let multi_pass_count = self.multi_pass_count;
+        let footer_detection = self.footer_detection_enabled;
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || match Scanner::new(&drive_path) {
@@ -326,10 +475,16 @@ impl RecoverPillApp {
                 let scanner_stop = scanner.get_should_stop();
                 scanner_stop.store(should_stop.load(Ordering::SeqCst), Ordering::SeqCst);
 
+                // Aplicar configuración avanzada (Bug 5)
+                scanner.set_footer_detection(footer_detection);
+                if multi_pass {
+                    scanner.set_scan_passes(multi_pass_count);
+                }
+
                 // Copiar referencia del flag del scanner para que stop_watcher pueda detenerlo
                 let scanner_stop_flag = scanner_stop.clone();
 
-                let stop_watcher = std::thread::spawn(move || {
+                let _stop_watcher = std::thread::spawn(move || {
                     while !should_stop.load(Ordering::SeqCst) {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
@@ -338,9 +493,17 @@ impl RecoverPillApp {
 
                 let progress_tx_clone = progress_tx.clone();
                 let result = match scan_mode {
-                    ScanMode::Signature => scanner.scan_with_progress(type_filters, min_recoverability, move |msg| {
-                        let _ = progress_tx_clone.send(msg);
-                    }),
+                    ScanMode::Signature => {
+                        if multi_pass {
+                            scanner.scan_multi_pass(type_filters, multi_pass_count, min_recoverability, move |msg| {
+                                let _ = progress_tx_clone.send(msg);
+                            })
+                        } else {
+                            scanner.scan_with_progress(type_filters, min_recoverability, move |msg| {
+                                let _ = progress_tx_clone.send(msg);
+                            })
+                        }
+                    },
                     ScanMode::FileSystem => scanner.scan_filesystem(move |msg| {
                         let _ = progress_tx_clone.send(msg);
                     }),
@@ -378,6 +541,10 @@ impl RecoverPillApp {
                 let json = &msg[9..];
                 if let Ok(file) = serde_json::from_str::<FoundFile>(json) {
                     self.found_files.push(file);
+                    // Re-aplicar ordenación actual para mantener consistencia
+                    if !self.found_files.is_empty() {
+                        self.sort_files(self.sort_by, self.sort_ascending);
+                    }
                 }
                 continue;
             }
@@ -454,8 +621,57 @@ impl RecoverPillApp {
         }
     }
 
+    fn process_android_results(&mut self) {
+        if let Some(ref rx) = self.android_scan_receiver {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.android_scan_result = Some(result.clone());
+                    self.android_is_scanning = false;
+                    self.android_scan_receiver = None;
+                    self.add_console_message(
+                        format!("✅ Escaneo Android completado: {} archivos en {}ms",
+                            result.found_files.len(), result.scan_time_ms),
+                        ConsoleLevel::Success,
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.android_is_scanning = false;
+                    self.android_scan_receiver = None;
+                }
+            }
+        }
+
+        if let Some(ref rx) = self.android_backup_receiver {
+            match rx.try_recv() {
+                Ok(Ok(dirs)) => {
+                    self.android_backup_in_progress = false;
+                    self.android_backup_receiver = None;
+                    self.add_console_message(
+                        format!("✅ Backup Android completado: {} directorios", dirs.len()),
+                        ConsoleLevel::Success,
+                    );
+                }
+                Ok(Err(e)) => {
+                    self.android_backup_in_progress = false;
+                    self.android_backup_receiver = None;
+                    self.add_console_message(
+                        format!("❌ Error en backup Android: {}", e),
+                        ConsoleLevel::Error,
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.android_backup_in_progress = false;
+                    self.android_backup_receiver = None;
+                }
+            }
+        }
+    }
+
     fn stop_scan(&mut self) {
         self.should_stop.store(true, Ordering::SeqCst);
+        self.stop_confirm = false;
     }
 
     fn stop_recovery(&mut self) {
@@ -632,6 +848,8 @@ impl RecoverPillApp {
 
         let drive_path = self.drives[drive_idx].path.clone();
         self.is_recovering = true;
+        self.recovery_start_time = Some(std::time::Instant::now());
+        self.recovery_eta = String::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.recovery_receiver = Some(rx);
@@ -814,6 +1032,28 @@ impl RecoverPillApp {
                 self.add_console_message(msg, ConsoleLevel::Error);
             } else {
                 self.add_console_message(msg, ConsoleLevel::Info);
+            }
+        }
+
+        // Calcular ETA
+        if self.recovery_progress > 0.0 && self.recovery_progress < 100.0 {
+            if let Some(start) = self.recovery_start_time {
+                let elapsed = start.elapsed().as_secs_f64();
+                let total_estimated = elapsed * 100.0 / self.recovery_progress;
+                let remaining = total_estimated - elapsed;
+                if remaining > 0.0 && remaining.is_finite() {
+                    let total_secs = remaining as u64;
+                    let hours = total_secs / 3600;
+                    let mins = (total_secs % 3600) / 60;
+                    let secs = total_secs % 60;
+                    self.recovery_eta = if hours > 0 {
+                        format!("ETA: {}h {:02}m {:02}s", hours, mins, secs)
+                    } else if mins > 0 {
+                        format!("ETA: {}m {:02}s", mins, secs)
+                    } else {
+                        format!("ETA: {}s", secs)
+                    };
+                }
             }
         }
     }
@@ -1004,7 +1244,7 @@ impl RecoverPillApp {
                                         return (Some(rgba.into_raw()), width, height, None);
                                     }
                                 }
-                                Err(e) => continue,
+                                Err(_e) => continue,
                             }
                         }
                         Err(_) => continue,
@@ -1073,8 +1313,9 @@ impl App for RecoverPillApp {
         self.process_preview_results();
         self.process_recovery_results();
         self.process_recovery_progress();
+        self.process_android_results();
 
-        if self.is_scanning || self.preview_loading || self.is_recovering {
+        if self.is_scanning || self.preview_loading || self.is_recovering || self.android_is_scanning || self.android_backup_in_progress {
             ctx.request_repaint();
         }
 
@@ -1083,6 +1324,158 @@ impl App for RecoverPillApp {
         style.visuals.window_fill = PANEL_BG;
         ctx.set_style(style);
 
+        // === ATAJOS DE TECLADO ===
+        use egui::Modifiers;
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, egui::Key::Enter)) {
+            if self.current_tab == MainTab::Scan && !self.is_scanning && self.selected_drive.is_some() {
+                self.start_scan();
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, egui::Key::R)) {
+            if self.current_tab == MainTab::Scan && !self.is_recovering && !self.found_files.is_empty() {
+                self.recover_selected_files();
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, egui::Key::A)) {
+            if self.current_tab == MainTab::Scan && !self.found_files.is_empty() {
+                self.select_all();
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, egui::Key::Escape)) {
+            if self.is_scanning {
+                self.stop_scan();
+            } else if self.is_recovering {
+                self.stop_recovery();
+            }
+        }
+
+        // === TAB BAR ===
+        egui::TopBottomPanel::top("tab_bar")
+            .min_height(36.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let scan_tab = egui::Button::new(
+                        egui::RichText::new("🔍 Escaneo").size(14.0)
+                    )
+                    .fill(if self.current_tab == MainTab::Scan { ACCENT_COLOR } else { egui::Color32::from_rgb(40, 44, 55) })
+                    .min_size(egui::vec2(100.0, 28.0));
+                    if ui.add(scan_tab).clicked() { self.current_tab = MainTab::Scan; }
+
+                    let android_tab = egui::Button::new(
+                        egui::RichText::new("📱 Android").size(14.0)
+                    )
+                    .fill(if self.current_tab == MainTab::Android { ANDROID_COLOR } else { egui::Color32::from_rgb(40, 44, 55) })
+                    .min_size(egui::vec2(100.0, 28.0));
+                    if ui.add(android_tab).clicked() { self.current_tab = MainTab::Android; }
+
+                    let settings_tab = egui::Button::new(
+                        egui::RichText::new("⚙️ Config").size(14.0)
+                    )
+                    .fill(if self.current_tab == MainTab::Settings { egui::Color32::from_rgb(80, 80, 100) } else { egui::Color32::from_rgb(40, 44, 55) })
+                    .min_size(egui::vec2(100.0, 28.0));
+                    if ui.add(settings_tab).clicked() { self.current_tab = MainTab::Settings; }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("recoverPill v1.0.0 | {}", BUILD_DATE))
+                                .size(9.0)
+                                .color(egui::Color32::from_gray(120)),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+            });
+
+        // === MAIN CONTENT ===
+        if self.current_tab == MainTab::Scan {
+            self.render_scan_content(ctx);
+        } else if self.current_tab == MainTab::Android {
+            self.render_android_content(ctx);
+        } else if self.current_tab == MainTab::Settings {
+            self.render_settings_content(ctx);
+        }
+
+        // === NOTIFICACIÓN FLOTANTE (Bug 4) ===
+        if let Some(ref notif) = self.current_notification {
+            if self.notification_timer > 0.0 {
+                egui::Area::new(egui::Id::new("notification_area"))
+                    .anchor(egui::Align2::RIGHT_TOP, [-20.0, 50.0])
+                    .show(ctx, |ui| {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 200))
+                            .rounding(8.0)
+                            .inner_margin(egui::Margin::same(12.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(notif)
+                                        .size(13.0)
+                                        .color(ACCENT_LIGHT),
+                                );
+                            });
+                    });
+            }
+        }
+
+        // === CONSOLA COMPARTIDA (Bug 3) ===
+        egui::TopBottomPanel::bottom("console_panel")
+            .resizable(true)
+            .default_height(120.0)
+            .min_height(60.0)
+            .show(ctx, |ui| {
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("📟 Consola de Sistema").size(13.0).strong().color(ACCENT_COLOR));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("🗑️ Limpiar").size(10.0)).clicked() {
+                            self.console_messages.clear();
+                        }
+                        ui.label(egui::RichText::new(format!("{} mensajes", self.console_messages.len())).size(9.0).color(egui::Color32::from_gray(120)));
+                    });
+                });
+                ui.add_space(3.0);
+                ui.separator();
+
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(15, 15, 20))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::same(5.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                for msg in self.console_messages.iter().rev().take(50) {
+                                    let (color, icon) = match msg.level {
+                                        ConsoleLevel::Info => (egui::Color32::from_gray(180), "ℹ️"),
+                                        ConsoleLevel::Warning => (WARNING_COLOR, "⚠️"),
+                                        ConsoleLevel::Error => (ERROR_COLOR, "❌"),
+                                        ConsoleLevel::Success => (SUCCESS_COLOR, "✅"),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(icon).size(10.0));
+                                        ui.label(
+                                            egui::RichText::new(&msg.text).color(color).size(10.0).monospace(),
+                                        );
+                                    });
+                                }
+                                if self.console_messages.is_empty() {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new("Esperando actividad...").color(egui::Color32::from_gray(80)).italics());
+                                    });
+                                }
+                            });
+                    });
+                ui.add_space(5.0);
+            });
+    }
+}
+
+impl RecoverPillApp {
+    fn render_scan_content(&mut self, ctx: &egui::Context) {
         // Panel izquierdo
         egui::SidePanel::left("control_panel")
             .min_width(200.0)
@@ -1228,14 +1621,16 @@ impl App for RecoverPillApp {
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
                         if !self.is_scanning {
+                            let drive_ready = self.selected_drive.is_some();
                             if ui
-                                .add(
+                                .add_enabled(drive_ready,
                                     egui::Button::new(
                                         egui::RichText::new("🚀 Iniciar Escaneo").size(14.0),
                                     )
-                                    .fill(ACCENT_COLOR)
+                                    .fill(if drive_ready { ACCENT_COLOR } else { egui::Color32::from_gray(60) })
                                     .min_size(egui::vec2(200.0, 35.0)),
                                 )
+                                .on_hover_text(if drive_ready { "" } else { "Selecciona una unidad primero" })
                                 .clicked()
                             {
                                 self.start_scan();
@@ -1253,15 +1648,32 @@ impl App for RecoverPillApp {
                                 );
                             });
                             ui.add_space(8.0);
+                            let stop_label = if self.stop_confirm {
+                                "⏹ ¿Confirmar?"
+                            } else {
+                                "⏹ Detener"
+                            };
                             if ui
                                 .add(
-                                    egui::Button::new(egui::RichText::new("⏹ Detener").size(13.0))
-                                        .fill(ERROR_COLOR)
+                                    egui::Button::new(egui::RichText::new(stop_label).size(13.0))
+                                        .fill(if self.stop_confirm { egui::Color32::from_rgb(200, 50, 30) } else { ERROR_COLOR })
                                         .min_size(egui::vec2(200.0, 30.0)),
                                 )
                                 .clicked()
                             {
-                                self.stop_scan();
+                                if self.stop_confirm {
+                                    self.stop_confirm = false;
+                                    self.stop_scan();
+                                } else {
+                                    self.stop_confirm = true;
+                                }
+                            }
+                            if self.stop_confirm {
+                                ui.label(
+                                    egui::RichText::new("Presiona de nuevo para confirmar")
+                                        .size(9.0)
+                                        .color(WARNING_COLOR),
+                                );
                             }
                             let progress_percent = self.scan_percentage as f32 / 100.0;
                             ui.add_space(8.0);
@@ -1457,16 +1869,6 @@ impl App for RecoverPillApp {
                             });
                         });
                         
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Buscar:");
-                            ui.add_space(3.0);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.filter_text)
-                                    .desired_width(130.0)
-                                    .hint_text("nombre..."),
-                            );
-                        });
                     });
 
                 ui.add_space(12.0);
@@ -1485,60 +1887,6 @@ impl App for RecoverPillApp {
                         ui.label(egui::RichText::new("• IA: ").size(11.0).color(ACCENT_COLOR));
                         ui.label(egui::RichText::new("Filtra automáticamente el ruido y sectores vacíos.").size(10.0));
                     });
-            });
-
-        // Panel inferior para la Consola (Todo el ancho)
-        egui::TopBottomPanel::bottom("console_panel")
-            .resizable(true)
-            .default_height(120.0)
-            .min_height(60.0)
-            .show(ctx, |ui| {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("📟 Consola de Sistema").size(13.0).strong().color(ACCENT_COLOR));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("🗑️ Limpiar").size(10.0)).clicked() {
-                            self.console_messages.clear();
-                        }
-                        ui.label(egui::RichText::new(format!("{} mensajes", self.console_messages.len())).size(9.0).color(egui::Color32::from_gray(120)));
-                    });
-                });
-                ui.add_space(3.0);
-                ui.separator();
-                
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(15, 15, 20))
-                    .rounding(4.0)
-                    .inner_margin(egui::Margin::same(5.0))
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .stick_to_bottom(true)
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                for msg in self.console_messages.iter().rev().take(50) {
-                                    let (color, icon) = match msg.level {
-                                        ConsoleLevel::Info => (egui::Color32::from_gray(180), "ℹ️"),
-                                        ConsoleLevel::Warning => (WARNING_COLOR, "⚠️"),
-                                        ConsoleLevel::Error => (ERROR_COLOR, "❌"),
-                                        ConsoleLevel::Success => (SUCCESS_COLOR, "✅"),
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(icon).size(10.0));
-                                        ui.label(
-                                            egui::RichText::new(&msg.text).color(color).size(10.0).monospace(),
-                                        );
-                                    });
-                                }
-                                if self.console_messages.is_empty() {
-                                    ui.vertical_centered(|ui| {
-                                        ui.add_space(10.0);
-                                        ui.label(egui::RichText::new("Esperando actividad...").color(egui::Color32::from_gray(80)).italics());
-                                    });
-                                }
-                            });
-                    });
-                ui.add_space(5.0);
             });
 
         // Panel derecho
@@ -1580,15 +1928,31 @@ impl App for RecoverPillApp {
                                         });
                                     } else if let Some(ref error) = self.preview_error {
                                         ui.vertical_centered(|ui| {
-                                            ui.label(egui::RichText::new("📷").size(36.0));
+                                            let file = &self.found_files[idx];
+                                            let thumb = get_thumb(file.file_type);
+                                            ui.label(egui::RichText::new(thumb).size(36.0));
                                             ui.label(
-                                                egui::RichText::new("No disponible")
-                                                    .size(12.0)
-                                                    .color(egui::Color32::from_gray(150)),
+                                                egui::RichText::new(format!("{}", file.file_type.extension().to_uppercase()))
+                                                    .size(14.0)
+                                                    .strong()
+                                                    .color(ACCENT_COLOR),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(format!("{} bytes", format_size(file.estimated_size)))
+                                                    .size(10.0)
+                                                    .color(egui::Color32::from_gray(160)),
                                             );
                                             ui.label(
+                                                egui::RichText::new(format!("Offset: 0x{:X}", file.offset))
+                                                    .size(9.0)
+                                                    .color(egui::Color32::from_gray(130))
+                                                    .monospace(),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.label(
                                                 egui::RichText::new(error)
-                                                    .size(10.0)
+                                                    .size(9.0)
                                                     .color(egui::Color32::from_gray(120)),
                                             );
                                         });
@@ -1894,6 +2258,13 @@ impl App for RecoverPillApp {
                                 .size(13.0)
                                 .color(WARNING_COLOR),
                             );
+                            if !self.recovery_eta.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&self.recovery_eta)
+                                        .size(11.0)
+                                        .color(egui::Color32::from_gray(160)),
+                                );
+                            }
                             ui.add_space(8.0);
                             if ui.button("⏹ Detener").clicked() {
                                 self.stop_recovery();
@@ -1966,6 +2337,57 @@ impl App for RecoverPillApp {
                             }
                         });
                     }
+                });
+            ui.add_space(6.0);
+
+            // Barra de búsqueda
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(45, 48, 60))
+                .rounding(4.0)
+                .inner_margin(egui::Margin::same(4.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("🔍").size(12.0));
+                        ui.add_space(4.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.filter_text)
+                                .desired_width(200.0)
+                                .hint_text("Filtrar por nombre o tipo..."),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.filter_text.clear();
+                        }
+                        if !self.filter_text.is_empty() {
+                            if ui.add(
+                                egui::Button::new(egui::RichText::new("✕").size(12.0).color(egui::Color32::from_gray(180)))
+                                    .min_size(egui::vec2(18.0, 18.0))
+                            ).clicked()
+                            {
+                                self.filter_text.clear();
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let visible_count = self.found_files.iter().filter(|f| {
+                                let text_match = self.filter_text.is_empty()
+                                    || f.file_name.to_lowercase().contains(&self.filter_text.to_lowercase())
+                                    || f.file_type.extension().to_lowercase().contains(&self.filter_text.to_lowercase());
+                                let type_match = if let Some(ref pattern) = self.type_filter {
+                                    if pattern.is_empty() { true } else {
+                                        let ext = f.file_type.extension().to_lowercase();
+                                        pattern.split(',').any(|p| p.trim().to_lowercase() == ext)
+                                    }
+                                } else { true };
+                                let quality_match = if self.quality_filter_enabled { f.recoverability >= self.min_recoverability } else { true };
+                                let not_duplicate = if self.hide_duplicates { !f.is_duplicate } else { true };
+                                text_match && type_match && quality_match && not_duplicate
+                            }).count();
+                            ui.label(
+                                egui::RichText::new(format!("{} visibles / {}", visible_count, self.found_files.len()))
+                                    .size(10.0)
+                                    .color(egui::Color32::from_gray(140)),
+                            );
+                        });
+                    });
                 });
             ui.add_space(6.0);
 
@@ -2111,13 +2533,28 @@ impl App for RecoverPillApp {
                             if ui.button("◀").clicked() && self.current_page > 0 {
                                 self.current_page -= 1;
                             }
-                            ui.label(format!("{} / {}", self.current_page + 1, total_pages));
+                            let mut page_num = self.current_page as i32 + 1;
+                            let dval = ui.add_sized(
+                                [90.0, 20.0],
+                                egui::DragValue::new(&mut page_num)
+                                    .speed(0.5)
+                                    .prefix("Pág: ")
+                                    .suffix(&format!("/{}", total_pages)),
+                            );
+                            if dval.changed() {
+                                self.current_page = (page_num - 1).max(0).min(total_pages as i32 - 1) as usize;
+                            }
                             if ui.button("▶").clicked() && self.current_page < total_pages - 1 {
                                 self.current_page += 1;
                             }
                             if ui.button("⏭").clicked() {
                                 self.current_page = total_pages - 1;
                             }
+                            ui.label(
+                                egui::RichText::new(format!("({} archivos)", total_files))
+                                    .size(10.0)
+                                    .color(egui::Color32::from_gray(140)),
+                            );
                         });
                     }
 
@@ -2300,6 +2737,403 @@ impl App for RecoverPillApp {
             });
         });
     }
+
+    fn render_android_content(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("📱 Recuperación Android").size(22.0).strong().color(ANDROID_COLOR));
+                if !self.adb_available {
+                    ui.label(egui::RichText::new("⚠️ ADB no detectado").size(14.0).color(ERROR_COLOR));
+                }
+            });
+            ui.add_space(10.0);
+            ui.separator();
+
+            if !self.adb_available {
+                egui::Frame::none()
+                    .fill(CARD_BG)
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(20.0))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new("📱").size(48.0));
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("ADB no detectado").size(16.0).strong().color(ERROR_COLOR));
+                            ui.add_space(5.0);
+                            ui.label("Instala Android SDK Platform Tools o conecta un dispositivo con depuración USB activada.");
+                            ui.add_space(10.0);
+                            if ui.button("🔍 Buscar ADB nuevamente").clicked() {
+                                let available = AndroidRecoveryEngine::is_available();
+                                self.adb_available = available;
+                                if available {
+                                    let mut engine = AndroidRecoveryEngine::new();
+                                    self.android_devices = engine.detect_devices();
+                                    self.android_engine = Some(engine);
+                                }
+                            }
+                        });
+                    });
+                ui.add_space(10.0);
+            } else {
+                // Android main content
+                egui::SidePanel::left("android_control")
+                    .min_width(250.0)
+                    .max_width(300.0)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("📱 Dispositivos").size(14.0).strong().color(ANDROID_COLOR));
+                        ui.add_space(5.0);
+
+                        if self.android_devices.is_empty() {
+                            egui::Frame::none()
+                                .fill(CARD_BG)
+                                .rounding(6.0)
+                                .inner_margin(egui::Margin::same(10.0))
+                                .show(ui, |ui| {
+                                    ui.label("No se detectaron dispositivos.");
+                                    if ui.button("🔄 Escanear").clicked() {
+                                        if let Some(ref mut engine) = self.android_engine {
+                                            self.android_devices = engine.detect_devices();
+                                        }
+                                    }
+                                });
+                        } else {
+                            for (i, device) in self.android_devices.iter().enumerate() {
+                                let is_selected = self.android_selected_device == Some(i);
+                                let bg = if is_selected { ANDROID_COLOR } else { CARD_BG };
+                                if egui::Frame::none()
+                                    .fill(bg)
+                                    .rounding(6.0)
+                                    .inner_margin(egui::Margin::same(8.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("📱").size(18.0));
+                                            ui.vertical(|ui| {
+                                                ui.label(egui::RichText::new(&device.model).size(13.0).strong());
+                                                ui.label(egui::RichText::new(&device.serial).size(10.0).color(egui::Color32::from_gray(150)));
+                                            });
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(format!("{} | Android {}", device.manufacturer, device.android_version));
+                                        if device.is_rooted {
+                                            ui.label(egui::RichText::new("✅ Rooteado").size(10.0).color(SUCCESS_COLOR));
+                                        }
+                                    }).response.clicked()
+                                {
+                                    self.android_selected_device = Some(i);
+                                }
+                                ui.add_space(4.0);
+                            }
+                        }
+
+                        ui.add_space(15.0);
+                        ui.label(egui::RichText::new("⚡ Acciones").size(14.0).strong());
+                        ui.add_space(5.0);
+                        egui::Frame::none()
+                            .fill(CARD_BG)
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::same(10.0))
+                            .show(ui, |ui| {
+                                if self.android_selected_device.is_none() {
+                                    ui.label("Selecciona un dispositivo primero");
+                                } else {
+                                    if !self.android_is_scanning {
+                                        if ui.add(
+                                            egui::Button::new(egui::RichText::new("🔍 Escanear Dispositivo").size(13.0))
+                                                .fill(ANDROID_COLOR)
+                                                .min_size(egui::vec2(220.0, 32.0))
+                                        ).clicked() {
+                                            self.start_android_scan();
+                                        }
+                                        ui.add_space(5.0);
+                                        if ui.add(
+                                            egui::Button::new(egui::RichText::new("💾 Backup Rápido").size(13.0))
+                                                .fill(ACCENT_COLOR)
+                                                .min_size(egui::vec2(220.0, 32.0))
+                                        ).clicked() {
+                                            self.start_android_backup();
+                                        }
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label("Escaneando...");
+                                        });
+                                        if ui.button("⏹ Detener").clicked() {
+                                            if let Some(ref engine) = self.android_engine {
+                                                engine.stop();
+                                            }
+                                            self.android_is_scanning = false;
+                                        }
+                                    }
+                                }
+                            });
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("📁 Destino").size(14.0).strong());
+                        ui.add_space(5.0);
+                        egui::Frame::none()
+                            .fill(CARD_BG)
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::same(10.0))
+                            .show(ui, |ui| {
+                                if ui.button("📂 Carpeta...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.android_output_folder = path.to_string_lossy().to_string();
+                                    }
+                                }
+                                if !self.android_output_folder.is_empty() {
+                                    ui.label(egui::RichText::new(&self.android_output_folder).size(10.0).italics().color(egui::Color32::from_gray(150)));
+                                }
+                            });
+                    });
+
+                // Android results panel
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(10.0);
+                    let scan_result = self.android_scan_result.as_ref().cloned();
+                    if let Some(result) = scan_result {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("📁 Archivos encontrados: {}", result.found_files.len())).size(15.0).strong());
+                            if !self.android_output_folder.is_empty() {
+                                if ui.button("💾 Recuperar Todo").clicked() {
+                                    self.recover_android_files();
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.separator();
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for (i, file) in result.found_files.iter().enumerate() {
+                                let bg = if i % 2 == 0 { egui::Color32::from_rgb(35, 38, 48) } else { egui::Color32::from_rgb(30, 32, 40) };
+                                egui::Frame::none()
+                                    .fill(bg)
+                                    .rounding(3.0)
+                                    .inner_margin(egui::Margin::same(4.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let icon = get_thumb_android(file.file_type);
+                                            ui.label(egui::RichText::new(icon).size(14.0));
+                                            ui.add_sized([200.0, 18.0], |ui: &mut egui::Ui| {
+                                                ui.label(egui::RichText::new(&file.file_name).size(10.0))
+                                            });
+                                            ui.add_sized([60.0, 18.0], |ui: &mut egui::Ui| {
+                                                ui.label(egui::RichText::new(file.file_type.extension().to_uppercase()).size(9.0).color(ACCENT_COLOR))
+                                            });
+                                            ui.add_sized([80.0, 18.0], |ui: &mut egui::Ui| {
+                                                ui.label(format_size(file.size))
+                                            });
+                                            let rec_col = if file.recoverability >= 70.0 { SUCCESS_COLOR } else if file.recoverability >= 40.0 { WARNING_COLOR } else { ERROR_COLOR };
+                                            ui.add_sized([60.0, 18.0], |ui: &mut egui::Ui| {
+                                                ui.add(egui::ProgressBar::new(file.recoverability as f32 / 100.0).fill(rec_col).desired_width(50.0))
+                                            });
+                                            ui.label(egui::RichText::new(format!("{:.0}%", file.recoverability)).size(9.0).color(rec_col));
+                                        });
+                                    });
+                                ui.add_space(2.0);
+                            }
+                        });
+                    } else {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(30.0);
+                            ui.label(egui::RichText::new("📱").size(48.0));
+                            ui.add_space(10.0);
+                            if self.android_is_scanning {
+                                ui.label("Escaneando dispositivo Android...");
+                                ui.spinner();
+                            } else {
+                                ui.label("Selecciona un dispositivo y escanea para comenzar");
+                                ui.label(egui::RichText::new("Archivos compatibles: Fotos, Videos, WhatsApp, APKs, Bases de Datos").size(10.0).color(egui::Color32::from_gray(150)));
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    fn render_settings_content(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("⚙️ Configuración Avanzada").size(22.0).strong().color(ACCENT_COLOR));
+            ui.add_space(10.0);
+            ui.separator();
+
+            egui::Grid::new("settings_grid").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
+                ui.label(egui::RichText::new("Escaneo Multi-Pass:").strong());
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.multi_pass_enabled, "Activar");
+                    if self.multi_pass_enabled {
+                        ui.add_space(10.0);
+                        ui.label("Pasadas:");
+                        ui.add(egui::Slider::new(&mut self.multi_pass_count, 2..=5).integer());
+                    }
+                });
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Detección de Footers:").strong());
+                ui.checkbox(&mut self.footer_detection_enabled, "Mejorar precisión en archivos fragmentados");
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Items por página:").strong());
+                ui.add(egui::Slider::new(&mut self.items_per_page, 50..=500).integer());
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Calidad mínima:").strong());
+                ui.add(egui::Slider::new(&mut self.min_recoverability, 0.0..=100.0).text("%"));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Ocultar duplicados:").strong());
+                ui.checkbox(&mut self.hide_duplicates, "Ocultar archivos duplicados en resultados");
+                ui.end_row();
+            });
+
+            ui.add_space(15.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new("📊 Estadísticas del Motor").size(16.0).strong());
+            ui.add_space(5.0);
+            egui::Frame::none()
+                .fill(CARD_BG)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    ui.label(format!("Firmas de archivos: {}", crate::core::signatures::SIGNATURE_DATABASE.len()));
+                    ui.label(format!("Footers conocidos: {}", crate::core::signatures::FOOTER_DATABASE.len()));
+                    ui.label(format!("Categorías: {}", get_categories().len()));
+                    ui.label(if self.adb_available { "ADB: ✅ Disponible" } else { "ADB: ❌ No disponible" });
+                });
+        });
+    }
+
+    fn start_android_scan(&mut self) {
+        let device_idx = match self.android_selected_device {
+            Some(i) => i,
+            None => return,
+        };
+        if device_idx >= self.android_devices.len() { return; }
+
+        let device = self.android_devices[device_idx].clone();
+        self.android_is_scanning = true;
+        self.android_scan_result = None;
+        self.add_console_message(format!("📱 Escaneando Android: {} ({})", device.model, device.serial), ConsoleLevel::Info);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.android_scan_receiver = Some(rx);
+
+        let progress_tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut engine = AndroidRecoveryEngine::new();
+            let result = engine.scan_data_partition(&device, |msg| {
+                info!("Android: {}", msg);
+            });
+            let _ = tx.send(result);
+            drop(progress_tx);
+        });
+    }
+
+    fn start_android_backup(&mut self) {
+        let device_idx = match self.android_selected_device {
+            Some(i) => i,
+            None => return,
+        };
+        if device_idx >= self.android_devices.len() { return; }
+        if self.android_output_folder.is_empty() { return; }
+
+        let device = self.android_devices[device_idx].clone();
+        let output = std::path::PathBuf::from(&self.android_output_folder);
+        self.android_backup_in_progress = true;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.android_backup_receiver = Some(rx);
+
+        self.add_console_message(format!("💾 Backup Android iniciado en: {}", self.android_output_folder), ConsoleLevel::Info);
+
+        std::thread::spawn(move || {
+            let engine = AndroidRecoveryEngine::new();
+            let result = engine.backup_device(&device.serial, &output, |msg| {
+                info!("Backup: {}", msg);
+            });
+            let _ = tx.send(result);
+        });
+    }
+
+    fn recover_android_files(&mut self) {
+        let result = match self.android_scan_result.clone() {
+            Some(r) => r,
+            None => {
+                self.add_console_message("No hay resultados de escaneo para recuperar".to_string(), ConsoleLevel::Warning);
+                return;
+            }
+        };
+
+        if self.android_output_folder.is_empty() {
+            self.add_console_message("Define una carpeta de destino primero".to_string(), ConsoleLevel::Warning);
+            return;
+        }
+
+        let serial = result.device.serial.clone();
+        let output = std::path::PathBuf::from(&self.android_output_folder);
+        let files_to_recover: Vec<(String, String, u64)> = result.found_files.iter()
+            .map(|f| (f.path.clone(), f.file_name.clone(), f.size))
+            .collect();
+
+        let total = files_to_recover.len();
+        if total == 0 {
+            self.add_console_message("No hay archivos para recuperar".to_string(), ConsoleLevel::Warning);
+            return;
+        }
+
+        self.add_console_message(
+            format!("💾 Recuperando {} archivos desde Android...", total),
+            ConsoleLevel::Info,
+        );
+
+        self.android_backup_in_progress = true;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.android_backup_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let engine = AndroidRecoveryEngine::new();
+            let mut recovered = Vec::new();
+            let mut had_error = false;
+
+            for (i, (remote_path, file_name, _size)) in files_to_recover.iter().enumerate() {
+                let rel_path = remote_path.trim_start_matches("/data/media/0/");
+                if rel_path.is_empty() { continue; }
+
+                let dest_path = output.join(rel_path);
+                if let Some(parent) = dest_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                match engine.recover_file(&serial, remote_path, &dest_path) {
+                    Ok(s) => {
+                        info!("✅ Recuperado: {} ({} bytes)", file_name, s);
+                        recovered.push(dest_path);
+                    }
+                    Err(e) => {
+                        error!("❌ Error recuperando {}: {}", file_name, e);
+                        had_error = true;
+                    }
+                }
+
+                if i > 0 && i % 10 == 0 {
+                    info!("Progreso Android: {}/{} archivos", i + 1, total);
+                }
+            }
+
+            if had_error {
+                let _ = tx.send(Err(format!("Completado con errores: {}/{} recuperados", recovered.len(), total)));
+            } else {
+                let _ = tx.send(Ok(recovered));
+            }
+        });
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -2352,7 +3186,30 @@ fn get_thumb(t: crate::core::signatures::FileType) -> &'static str {
         FileType::Odt => "📃",
         FileType::Zip | FileType::Rar | FileType::SevenZip | FileType::Tar | FileType::Gzip => "📦",
         FileType::Exe | FileType::Dll | FileType::Msi => "⚙️",
+        FileType::Apk => "📦",
+        FileType::Dex => "⚡",
+        FileType::Db => "🗄️",
+        FileType::Xml => "📋",
+        FileType::ThreeGp => "🎬",
+        FileType::Text => "📄",
+        FileType::AndroidFile => "📱",
         FileType::Unknown => "❓",
+    }
+}
+
+fn get_thumb_android(t: crate::core::signatures::FileType) -> &'static str {
+    use crate::core::signatures::FileType;
+    match t {
+        FileType::Jpeg | FileType::Png | FileType::Gif | FileType::Bmp | FileType::Webp | FileType::Heic => "🖼️",
+        FileType::Mp4 | FileType::ThreeGp => "🎬",
+        FileType::Mp3 | FileType::Ogg => "🎵",
+        FileType::Apk => "📦",
+        FileType::Dex => "⚡",
+        FileType::Db => "🗄️",
+        FileType::Pdf | FileType::Docx | FileType::Text => "📄",
+        FileType::Xml => "📋",
+        FileType::Zip => "📦",
+        _ => "📱",
     }
 }
 

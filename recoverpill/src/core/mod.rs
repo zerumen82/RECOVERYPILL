@@ -8,4 +8,4 @@ pub mod signatures;
 
 pub use recovery::RecoveryEngine;
 pub use scanner::{FoundFile, ScanProgress, ScanResult, Scanner};
-pub use signatures::{FileSignature, FileType, SIGNATURE_DATABASE};
+pub use signatures::{FileSignature, FileType, SIGNATURE_DATABASE, FOOTER_DATABASE};

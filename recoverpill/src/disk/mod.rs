@@ -5,7 +5,9 @@
 pub mod access;
 pub mod drive_info;
 pub mod filesystem;
+pub mod android;
 
 pub use access::DiskReader;
 pub use drive_info::{DriveInfo, DriveType};
 pub use filesystem::{FileEntry, FileSystemReader, FileSystemType};
+pub use android::{AndroidDevice, AndroidRecoveryEngine, AndroidScanResult, AndroidFileEntry, AndroidPartition};

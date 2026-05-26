@@ -1,15 +1,18 @@
 //! Motor de escaneo de disco
 //!
 //! Escanea el disco en busca de archivos borrados usando firmas de archivos.
+//! Implementa multi-pass scanning con detección de fragmentación,
+//! footer-based carving, y análisis heurístico avanzado.
 
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ai::classifier::AIClassifier;
-use crate::core::signatures::{detect_file_type, FileSignature, FileType, SIGNATURE_DATABASE};
+use crate::core::signatures::{detect_file_type, FileSignature, FileType, SIGNATURE_DATABASE, FOOTER_DATABASE};
 use crate::disk::access::DiskReader;
 use crate::disk::filesystem::FileSystemReader;
 
@@ -86,6 +89,14 @@ pub struct Scanner {
     ai_classifier: AIClassifier,
     // Filtro de calidad mínima (0-100)
     min_recoverability: f64,
+    // Multi-pass scan: cantidad de pasadas
+    scan_passes: u32,
+    // Overlap entre chunks para detectar archivos fragmentados
+    chunk_overlap: usize,
+    // Footer detection habilitada
+    footer_detection: bool,
+    // Mapa de sectores ya escaneados para evitar duplicados
+    scanned_sectors: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl Scanner {
@@ -107,6 +118,10 @@ impl Scanner {
             chunk_size: 2 * 1024 * 1024, // 2MB chunks - balance entre velocidad y memoria
             ai_classifier: AIClassifier::new(),
             min_recoverability: 0.0, // Sin filtro por defecto
+            scan_passes: 1,       // Una pasada por defecto (más = más profundo)
+            chunk_overlap: 4096,  // 4KB overlap para detectar archivos fragmentados
+            footer_detection: true, // Footer detection activada
+            scanned_sectors: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -118,17 +133,76 @@ impl Scanner {
         })
     }
 
-    /// Escanea el disco con callback de progreso (optimizado)
-    pub fn scan_with_progress<F>(
+    /// Escanea con múltiples pasadas para detectar archivos fragmentados
+    pub fn scan_multi_pass<F>(
         &mut self,
         enabled_types: Option<Vec<FileType>>,
+        passes: u32,
         min_recoverability: f64,
         mut progress_callback: F,
     ) -> ScanResult
     where
         F: FnMut(String) + Send + 'static,
     {
-        info!("Iniciando escaneo profundo de: {}", self.drive_path);
+        self.scan_passes = passes;
+        info!("Iniciando escaneo multi-pass ({} pasadas)", passes);
+        progress_callback(format!("🔄 Escaneo multi-pass: {} pasadas", passes));
+
+        let mut combined_result = self.scan_with_progress_impl(
+            enabled_types.clone(),
+            min_recoverability,
+            &mut progress_callback,
+            0,
+        );
+
+        if passes > 1 {
+            progress_callback("🔄 Segunda pasada con overlap para archivos fragmentados...".to_string());
+            let pass2_result = self.scan_with_progress_impl(
+                enabled_types,
+                min_recoverability,
+                &mut progress_callback,
+                1,
+            );
+
+            // Merge results, avoiding duplicates
+            let existing_offsets: HashSet<u64> = combined_result.files_found.iter().map(|f| f.offset).collect();
+            for file in pass2_result.files_found {
+                if !existing_offsets.contains(&file.offset) {
+                    combined_result.files_found.push(file);
+                }
+            }
+        }
+
+        combined_result
+    }
+
+    /// Escanea con callback de progreso (wrapper público)
+    pub fn scan_with_progress<F>(
+        &mut self,
+        enabled_types: Option<Vec<FileType>>,
+        min_recoverability: f64,
+        progress_callback: F,
+    ) -> ScanResult
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let mut cb = progress_callback;
+        self.scan_with_progress_impl(enabled_types, min_recoverability, &mut cb, 0)
+    }
+
+    /// Implementación interna del escaneo con soporte multi-pass
+    fn scan_with_progress_impl<F>(
+        &mut self,
+        enabled_types: Option<Vec<FileType>>,
+        min_recoverability: f64,
+        mut progress_callback: &mut F,
+        pass: u32,
+    ) -> ScanResult
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let pass_label = if pass == 0 { "principal".to_string() } else { format!("pasada {}", pass + 1) };
+        info!("Iniciando escaneo {} de: {}", pass_label, self.drive_path);
         let start_time = std::time::Instant::now();
 
         self.should_stop.store(false, Ordering::SeqCst);
@@ -137,10 +211,16 @@ impl Scanner {
         // Guardar filtro de calidad
         self.min_recoverability = min_recoverability;
 
-        // Limpiar resultados anteriores
-        {
-            let mut files = self.found_files.write();
-            files.clear();
+        // Limpiar resultados anteriores solo en primera pasada
+        if pass == 0 {
+            {
+                let mut files = self.found_files.write();
+                files.clear();
+            }
+            {
+                let mut scanned = self.scanned_sectors.write();
+                scanned.clear();
+            }
         }
         {
             let mut progress = self.progress.write();
@@ -165,8 +245,9 @@ impl Scanner {
         let mut bytes_scanned: u64 = 0;
 
         // Chunks más grandes para mejor rendimiento en discos formateados
-        let chunk_size = 2 * 1024 * 1024; // 2MB por chunk - mejor rendimiento
-        let mut offset: u64 = 0;
+        let chunk_size = 2 * 1024 * 1024; // 2MB por chunk
+        let overlap = if pass > 0 { self.chunk_overlap } else { 0 };
+        let mut offset: u64 = if pass > 0 { overlap as u64 / 2 } else { 0 };
 
         // Log de diagnóstico - enviar a través del callback para que se vea en la UI
         progress_callback(format!("=== DIAGNÓSTICO DE ESCANEO ==="));
@@ -234,8 +315,23 @@ impl Scanner {
                 break;
             }
 
+            // Registrar sector como escaneado
+            {
+                let sector_key = offset / 4096;
+                let mut scanned = self.scanned_sectors.write();
+                scanned.insert(sector_key);
+            }
+
             // BÚSQUEDA PROFUNDA: Escanear el chunk de forma paralela y exhaustiva
-            let found = self.search_signatures_deep(&data, offset, &enabled_types);
+            let found = if pass > 0 {
+                // En pasadas secundarias, usar búsqueda heurística con footer
+                let mut heuristic = self.search_signatures_heuristic(&data, offset, &enabled_types);
+                let mut footer_based = self.smart_carve_with_footer(&data, offset);
+                heuristic.append(&mut footer_based);
+                heuristic
+            } else {
+                self.search_signatures_deep(&data, offset, &enabled_types)
+            };
 
             if self.should_stop.load(Ordering::SeqCst) {
                 break;
@@ -263,11 +359,12 @@ impl Scanner {
             }
 
             let advance = if skip_distance > 0 {
-                // Saltar el archivo pero alineado a sectores
-                // IMPORTANTE: Limitar el salto para no perder archivos
-                // Usar el mínimo entre skip_distance y chunk_size para evitar saltos muy grandes
                 let limited_skip = std::cmp::min(skip_distance, (current_chunk * 10) as u64);
                 (limited_skip / 512) * 512
+            } else if pass > 0 && overlap > 0 {
+                // Usar overlap parcial para pasadas multi-pass
+                let step = current_chunk.saturating_sub(overlap);
+                if step < 512 { current_chunk as u64 } else { step as u64 }
             } else {
                 current_chunk as u64
             };
@@ -337,6 +434,203 @@ impl Scanner {
                 None
             },
         }
+    }
+
+    /// Escaneo con detección de footers para reconstruir archivos fragmentados
+    fn smart_carve_with_footer(&self, data: &[u8], base_offset: u64) -> Vec<FoundFile> {
+        let mut found = Vec::new();
+        let mut i = 0;
+
+        while i < data.len() {
+            if self.should_stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Buscar header (magic bytes) en cada posición
+            for sig in SIGNATURE_DATABASE.iter() {
+                if sig.magic_bytes.is_empty() || sig.offset >= data.len() - i {
+                    continue;
+                }
+
+                let check_pos = i + sig.offset;
+                if check_pos + sig.magic_bytes.len() > data.len() {
+                    continue;
+                }
+
+                let mut matches = true;
+                for (j, &byte) in sig.magic_bytes.iter().enumerate() {
+                    if data[check_pos + j] != byte {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if matches {
+                    let file_offset = base_offset + check_pos as u64;
+                    let remaining = &data[check_pos..];
+
+                    // Intentar encontrar el footer para estimar tamaño real
+                    let estimated_size = if self.footer_detection {
+                        self.find_file_via_footer(remaining, &sig.file_type)
+                    } else {
+                        self.find_file_boundaries(remaining, &sig.file_type)
+                    };
+
+                    let entropy = calculate_entropy(remaining);
+                    let recoverability = self.calculate_carve_recoverability(
+                        &sig.file_type, estimated_size, entropy,
+                    );
+
+                    found.push(FoundFile {
+                        offset: file_offset,
+                        file_type: sig.file_type,
+                        file_name: format!(
+                            "{}_{}",
+                            sig.file_type.extension().to_uppercase(),
+                            file_offset / 1024 / 1024
+                        ),
+                        estimated_size,
+                        recoverability,
+                        entropy,
+                        signature_matched: format!(
+                            "{:02X?}",
+                            &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]
+                        ),
+                        selected: true,
+                        is_validated: false,
+                        content_hash: None,
+                        is_duplicate: false,
+                        duplicate_group: None,
+                    });
+
+                    // Saltar el archivo encontrado
+                    let skip = std::cmp::max(estimated_size as usize, 512);
+                    i += skip;
+                    break;
+                }
+            }
+
+            i += 1; // byte-by-byte scanning for fragmented files (slow but thorough)
+        }
+
+        found
+    }
+
+    /// Encuentra el fin de archivo usando footer conocidos
+    fn find_file_via_footer(&self, data: &[u8], file_type: &FileType) -> u64 {
+        if let Some(footer) = FOOTER_DATABASE.get(file_type) {
+            if data.len() >= footer.len() {
+                // Buscar footer de atrás hacia adelante
+                for i in (0..data.len().saturating_sub(footer.len())).rev() {
+                    let mut matches = true;
+                    for (j, &byte) in footer.iter().enumerate() {
+                        if data[i + j] != byte {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        return (i + footer.len()) as u64;
+                    }
+                }
+            }
+        }
+
+        // Fallback: buscar footer específicos por tipo
+        match file_type {
+            FileType::Jpeg => {
+                for i in (2..data.len().saturating_sub(1)).rev() {
+                    if data[i] == 0xFF && data[i + 1] == 0xD9 {
+                        return (i + 2) as u64;
+                    }
+                }
+            }
+            FileType::Png => {
+                for i in (8..data.len().saturating_sub(7)).rev() {
+                    if &data[i..i + 4] == b"IEND"
+                        && data[i + 4] == 0xAE
+                        && data[i + 5] == 0x42
+                        && data[i + 6] == 0x60
+                        && data[i + 7] == 0x82
+                    {
+                        return (i + 8) as u64;
+                    }
+                }
+            }
+            FileType::Gif => {
+                for i in (2..data.len().saturating_sub(1)).rev() {
+                    if data[i] == 0x00 && data[i + 1] == 0x3B {
+                        return (i + 2) as u64;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        data.len() as u64
+    }
+
+    /// Escanea un chunk usando firmas con búsqueda heurística
+    fn search_signatures_heuristic(
+        &self,
+        data: &[u8],
+        base_offset: u64,
+        enabled_types: &Option<Vec<FileType>>,
+    ) -> Vec<FoundFile> {
+        let mut found = Vec::new();
+        let step = 256u64; // Búsqueda más granular que 512 para fragmentos pequeños
+
+        for offset_in_chunk in (0..data.len()).step_by(step as usize) {
+            if self.should_stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if Scanner::is_chunk_empty(&data[offset_in_chunk..]) {
+                continue;
+            }
+
+            let window = &data[offset_in_chunk..std::cmp::min(offset_in_chunk + 512, data.len())];
+
+            for sig in SIGNATURE_DATABASE.iter() {
+                if sig.magic_bytes.is_empty() { continue; }
+
+                if let Some(ref types) = enabled_types {
+                    if !types.contains(&sig.file_type) { continue; }
+                }
+
+                if sig.matches(window) {
+                    let entropy = calculate_entropy(window);
+                    if entropy < 0.1 { continue; }
+
+                    let estimated_size = if self.footer_detection {
+                        self.find_file_via_footer(window, &sig.file_type)
+                    } else {
+                        sig.estimate_size(window).unwrap_or(0)
+                    };
+
+                    found.push(FoundFile {
+                        offset: base_offset + offset_in_chunk as u64,
+                        file_type: sig.file_type,
+                        file_name: format!(
+                            "{}_{}",
+                            sig.file_type.extension().to_uppercase(),
+                            (base_offset + offset_in_chunk as u64) / 1024 / 1024
+                        ),
+                        estimated_size,
+                        recoverability: 60.0,
+                        entropy,
+                        signature_matched: format!("{:02X?}", &sig.magic_bytes[..std::cmp::min(4, sig.magic_bytes.len())]),
+                        selected: true,
+                        is_validated: false,
+                        content_hash: None,
+                        is_duplicate: false,
+                        duplicate_group: None,
+                    });
+                    break;
+                }
+            }
+        }
+        found
     }
 
     /// Deep scan por carving - busca archivos incluso sin firmas completas (OPTIMIZADO)
@@ -776,10 +1070,6 @@ impl Scanner {
 
         // Optimización: buscar solo en el inicio del chunk para firmas completas
         // y luego hacer búsqueda dispersa para el resto
-        let search_regions = [
-            (0, std::cmp::min(512, data.len())), // Inicio del chunk - búsqueda densa
-        ];
-
         // Búsqueda densa al inicio (donde es más probable encontrar firmas)
         let window_size = 64;
         let step = 16;
@@ -1027,6 +1317,21 @@ impl Scanner {
     /// Establece el tamaño del chunk
     pub fn set_chunk_size(&mut self, size: usize) {
         self.chunk_size = size;
+    }
+
+    /// Establece el número de pasadas multi-pass
+    pub fn set_scan_passes(&mut self, passes: u32) {
+        self.scan_passes = passes;
+    }
+
+    /// Activa/desactiva detección de footers
+    pub fn set_footer_detection(&mut self, enabled: bool) {
+        self.footer_detection = enabled;
+    }
+
+    /// Establece el overlap entre chunks (para multi-pass)
+    pub fn set_chunk_overlap(&mut self, overlap: usize) {
+        self.chunk_overlap = overlap;
     }
 
     /// Escanea el sistema de archivos en busca de archivos
@@ -1472,9 +1777,9 @@ fn extract_mp3_metadata_filename(data: &[u8]) -> Option<String> {
     // Buscar ID3v2 tag al principio del archivo
     if data[0..3] == [0x49, 0x44, 0x33] {
         // "ID3"
-        let major_ver = data[3];
-        let revision = data[4];
-        let flags = data[5];
+        let _major_ver = data[3];
+        let _revision = data[4];
+        let _flags = data[5];
         let size = (data[6] as u32 & 0x7F) << 21
             | (data[7] as u32 & 0x7F) << 14
             | (data[8] as u32 & 0x7F) << 7

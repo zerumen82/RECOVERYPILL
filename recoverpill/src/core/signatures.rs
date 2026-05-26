@@ -3,6 +3,7 @@
 //! Define las firmas (magic bytes) para detectar diferentes tipos de archivos.
 
 use std::sync::LazyLock;
+use std::collections::HashMap;
 
 /// Tipos de archivos soportados
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -55,6 +56,14 @@ pub enum FileType {
     Exe,
     Dll,
     Msi,
+    // Android / Móviles
+    Apk,        // Android Package
+    Dex,        // Dalvik Executable
+    Db,         // SQLite Database
+    Xml,        // Android XML
+    ThreeGp,    // 3GP Video
+    Text,       // Text file
+    AndroidFile,// Generic Android file
     // Otros
     Unknown,
 }
@@ -104,6 +113,13 @@ impl FileType {
             FileType::Exe => "exe",
             FileType::Dll => "dll",
             FileType::Msi => "msi",
+            FileType::Apk => "apk",
+            FileType::Dex => "dex",
+            FileType::Db => "db",
+            FileType::Xml => "xml",
+            FileType::ThreeGp => "3gp",
+            FileType::Text => "txt",
+            FileType::AndroidFile => "android",
             FileType::Unknown => "bin",
         }
     }
@@ -152,6 +168,13 @@ impl FileType {
             FileType::Exe => "Executable",
             FileType::Dll => "Dynamic Library",
             FileType::Msi => "Installer",
+            FileType::Apk => "Android App",
+            FileType::Dex => "Dalvik Executable",
+            FileType::Db => "SQLite Database",
+            FileType::Xml => "XML File",
+            FileType::ThreeGp => "3GP Video",
+            FileType::Text => "Text File",
+            FileType::AndroidFile => "Android File",
             FileType::Unknown => "Unknown",
         }
     }
@@ -202,6 +225,12 @@ impl FileType {
 
             FileType::Exe | FileType::Dll | FileType::Msi => "Ejecutables",
 
+            FileType::Apk | FileType::Dex | FileType::AndroidFile => "Android",
+
+            FileType::Db | FileType::Xml | FileType::Text => "Datos",
+
+            FileType::ThreeGp => "Video",
+
             FileType::Unknown => "Otros",
         }
     }
@@ -240,9 +269,9 @@ impl FileSignature {
             FileType::Gif => estimate_gif_size(data),
             FileType::Bmp => estimate_bmp_size(data),
             FileType::Pdf => estimate_pdf_size(data),
-            FileType::Zip => estimate_zip_size(data),
+            FileType::Zip | FileType::Apk => estimate_zip_size(data),
             FileType::Mp3 => estimate_mp3_size(data),
-            FileType::Mp4 => estimate_mp4_size(data),
+            FileType::Mp4 | FileType::ThreeGp => estimate_mp4_size(data),
             _ => None,
         }
     }
@@ -651,7 +680,95 @@ pub static SIGNATURE_DATABASE: LazyLock<Vec<FileSignature>> = LazyLock::new(|| {
             min_size: 100,
             max_size: Some(500_000_000),
         },
+        // === ANDROID / MÓVILES ===
+        // APK - Android Package (ZIP-based, también JAR)
+        FileSignature {
+            file_type: FileType::Apk,
+            magic_bytes: &[0x50, 0x4B, 0x03, 0x04],
+            offset: 0,
+            min_size: 1000,
+            max_size: Some(500_000_000),
+        },
+        // DEX - Dalvik Executable (035)
+        FileSignature {
+            file_type: FileType::Dex,
+            magic_bytes: &[0x64, 0x65, 0x78, 0x0A, 0x30, 0x33, 0x35, 0x00],
+            offset: 0,
+            min_size: 100,
+            max_size: Some(100_000_000),
+        },
+        // DEX - Dalvik Executable (036)
+        FileSignature {
+            file_type: FileType::Dex,
+            magic_bytes: &[0x64, 0x65, 0x78, 0x0A, 0x30, 0x33, 0x36, 0x00],
+            offset: 0,
+            min_size: 100,
+            max_size: Some(100_000_000),
+        },
+        // DEX - Dalvik Executable (037)
+        FileSignature {
+            file_type: FileType::Dex,
+            magic_bytes: &[0x64, 0x65, 0x78, 0x0A, 0x30, 0x33, 0x37, 0x00],
+            offset: 0,
+            min_size: 100,
+            max_size: Some(100_000_000),
+        },
+        // SQLite Database
+        FileSignature {
+            file_type: FileType::Db,
+            magic_bytes: &[0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00],
+            offset: 0,
+            min_size: 100,
+            max_size: Some(10_000_000_000),
+        },
+        // Android Binary XML (AXML)
+        FileSignature {
+            file_type: FileType::Xml,
+            magic_bytes: &[0x03, 0x00, 0x08, 0x00],
+            offset: 0,
+            min_size: 50,
+            max_size: Some(10_000_000),
+        },
+        // XML Text
+        FileSignature {
+            file_type: FileType::Xml,
+            magic_bytes: &[0x3C, 0x3F, 0x78, 0x6D, 0x6C], // <?xml
+            offset: 0,
+            min_size: 20,
+            max_size: Some(100_000_000),
+        },
+        // 3GP Video
+        FileSignature {
+            file_type: FileType::ThreeGp,
+            magic_bytes: &[0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x33, 0x67, 0x70],
+            offset: 4,
+            min_size: 100,
+            max_size: Some(10_000_000_000),
+        },
+        // 3GP Video (3gpp brand)
+        FileSignature {
+            file_type: FileType::ThreeGp,
+            magic_bytes: &[0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x33, 0x67, 0x67],
+            offset: 4,
+            min_size: 100,
+            max_size: Some(10_000_000_000),
+        },
     ]
+});
+
+/// Footers conocidos para detección de fin de archivo (file carving)
+pub static FOOTER_DATABASE: LazyLock<HashMap<FileType, &'static [u8]>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert(FileType::Jpeg, &b"\xFF\xD9"[..]);
+    m.insert(FileType::Png, &b"\xAE\x42\x60\x82"[..]);
+    m.insert(FileType::Gif, &b"\x00\x3B"[..]);
+    m.insert(FileType::Pdf, b"%%EOF");
+    m.insert(FileType::Zip, &b"\x50\x4B\x05\x06"[..]);
+    m.insert(FileType::Apk, &b"\x50\x4B\x05\x06"[..]);
+    m.insert(FileType::Mp3, &b"\xFF\xFB"[..]);
+    m.insert(FileType::Ogg, b"OggS");
+    m.insert(FileType::Flac, &b"\x66\x4C\x61\x43"[..]);
+    m
 });
 
 /// Busca una firma en los datos dados
@@ -673,6 +790,8 @@ pub fn get_categories() -> Vec<&'static str> {
         "Audio",
         "Video",
         "Ejecutables",
+        "Android",
+        "Datos",
         "Otros",
     ]
 }
